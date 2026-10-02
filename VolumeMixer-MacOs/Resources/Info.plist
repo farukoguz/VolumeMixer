@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>VolumeMixer</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.volumemixer.app</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Volume Mixer</string>
+	<key>CFBundleDisplayName</key>
+	<string>Volume Mixer</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.2</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
+
+	<!-- Required for kTCCServiceAudioCapture. Without this key macOS denies
+	     system-audio capture SILENTLY: every Core Audio call still returns
+	     noErr but every tap buffer is filled with zeros. -->
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Volume Mixer taps each app's audio output so it can adjust that app's volume independently. Audio is processed in memory on this Mac and is never recorded, stored, or transmitted.</string>
+</dict>
+</plist>
