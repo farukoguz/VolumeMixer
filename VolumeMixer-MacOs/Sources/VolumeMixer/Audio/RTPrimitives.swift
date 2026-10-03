@@ -339,6 +339,13 @@ func scaleInPlace(_ samples: UnsafeMutablePointer<Float>, count: Int, gain: Floa
 /// `stride` is how many samples of destination each source frame occupies: 2 for
 /// stereo, 1 for a mono device that hands us a single buffer. Without it a mono
 /// output would be written twice and come out doubled.
+///
+/// A mono destination gets the two channels summed rather than one of them
+/// picked: dropping the right channel would lose everything panned to it, which
+/// is the sort of fault nobody notices until a device is plugged into a mono
+/// output. Summing rather than averaging can exceed full scale for content that
+/// is identical in both channels, but averaging would cost 6 dB on the centered
+/// majority of music, and the levels here are under the user's control anyway.
 @inline(__always)
 func accumulateInterleaved(_ source: UnsafePointer<Float>,
                            count: Int,
@@ -351,9 +358,11 @@ func accumulateInterleaved(_ source: UnsafePointer<Float>,
     let bound = min(frames, destinationFrames)
     var frame = 0
     while frame < bound {
-        destination[frame * outputStride] += source[frame * 2]
         if outputStride > 1 {
+            destination[frame * outputStride] += source[frame * 2]
             destination[frame * outputStride + 1] += source[frame * 2 + 1]
+        } else {
+            destination[frame] += source[frame * 2] + source[frame * 2 + 1]
         }
         frame += 1
     }

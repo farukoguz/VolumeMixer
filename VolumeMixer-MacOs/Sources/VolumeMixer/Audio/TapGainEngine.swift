@@ -606,21 +606,45 @@ final class TapGainEngine: GainEngine {
 
         table.forEach { object, _ in
             guard let channel = object as? TapChannel else { return }
-            let framesRead = channel.ring.read(into: scratch, frameCount: usableFrames)
-            guard framesRead > 0 else { return }
+            TapGainEngine.mix(channel, scratch: scratch, frames: usableFrames,
+                              sampleCount: sampleCount, destination: destination, right: right,
+                              deinterleaved: deinterleaved, outputChannels: outputChannels,
+                              limit: destinationSamples, peakDecay: peakDecay)
+        }
+    }
 
-            let mixed = scaleInPlace(scratch, count: sampleCount, gain: channel.gain.value)
-            // Decay instead of latching, otherwise a meter pins at the last
-            // non-zero peak for as long as the app stays routed.
-            channel.peak.value = max(mixed, channel.peak.value * peakDecay)
+    /// One channel's contribution to a mix cycle: drain, scale, meter, accumulate.
+    ///
+    /// Split out of `mix` so that the gain path can be tested against real code
+    /// instead of a reimplementation of it in the test. Per-app gain is the one
+    /// claim that cannot be checked on a machine with no capture permission, so
+    /// the arithmetic that implements it is worth pinning down here.
+    ///
+    /// Real-time safe: no allocation, no locks, no Objective-C.
+    @inline(__always)
+    static func mix(_ channel: TapChannel,
+                    scratch: UnsafeMutablePointer<Float>,
+                    frames: Int,
+                    sampleCount: Int,
+                    destination: UnsafeMutablePointer<Float>,
+                    right: UnsafeMutablePointer<Float>,
+                    deinterleaved: Bool,
+                    outputChannels: Int,
+                    limit: Int,
+                    peakDecay: Float) {
+        let framesRead = channel.ring.read(into: scratch, frameCount: frames)
+        guard framesRead > 0 else { return }
 
-            if deinterleaved {
-                accumulatePlanar(scratch, frames: framesRead, left: destination, right: right)
-            } else {
-                accumulateInterleaved(scratch, count: sampleCount, into: destination,
-                                      limit: destinationSamples,
-                                      stride: deinterleaved ? 1 : outputChannels)
-            }
+        let mixed = scaleInPlace(scratch, count: sampleCount, gain: channel.gain.value)
+        // Decay instead of latching, otherwise a meter pins at the last
+        // non-zero peak for as long as the app stays routed.
+        channel.peak.value = max(mixed, channel.peak.value * peakDecay)
+
+        if deinterleaved {
+            accumulatePlanar(scratch, frames: framesRead, left: destination, right: right)
+        } else {
+            accumulateInterleaved(scratch, count: sampleCount, into: destination,
+                                  limit: limit, stride: outputChannels)
         }
     }
 

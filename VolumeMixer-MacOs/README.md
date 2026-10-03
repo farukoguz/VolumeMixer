@@ -123,7 +123,9 @@ default output ◀── tap-only aggregate device ◀── one mixer IOProc �
   float, so both the tap's and the device's format are verified as packed float32
   mono/stereo before anything starts. A mismatch is refused with a reason instead
   of producing noise, and the mixer distinguishes a mono single-buffer device from
-  a deinterleaved stereo pair so a mono output is not summed into itself.
+  a deinterleaved stereo pair so a mono output is not summed into itself. A mono
+  destination folds the right channel into the left rather than dropping it, so
+  nothing disappears when something is plugged into a mono output.
 - **Recovery** — the watchdog runs on its own queue, not on the control queue, so it
   can still release taps if a HAL call is stuck. Engine state shared between the
   control queue, the watchdog and the UI is guarded by a recursive lock that the
@@ -140,7 +142,7 @@ default output ◀── tap-only aggregate device ◀── one mixer IOProc �
 
 ## Tests
 
-`swift test` runs 43 tests covering what can be verified without audio hardware or
+`swift test` runs 56 tests covering what can be verified without audio hardware or
 permission:
 
 - ring buffer: write/read, wraparound, overwrite-on-overrun, frame accounting
@@ -149,7 +151,11 @@ permission:
 - gain scaling, including the silence-preserving and unmute cases
 - the mixer's summation contract, which is what keeps two channels from replacing
   each other instead of adding
-- mono destination handling, where a naive stereo stride would double every sample
+- mono destination handling, where a naive stereo stride would double every sample,
+  and where the right channel must be folded in rather than dropped
+- the per-app gain path itself, driven through the mixer's real per-channel code:
+  unity, half, boost, mute, and two or three apps summing to the arithmetic total,
+  with the meter reporting the post-gain level and decaying when an app goes quiet
 - stream-format acceptance, including integer, unpacked and surround rejections
 - app identity, and that a PID key is never persisted
 
@@ -200,17 +206,20 @@ Verified by running against real hardware:
 - the real tap format passing validation
 - the permission prompt appearing once and not again
 - a command-line player attaching under `path-/usr/bin/afplay`
-- 43 unit tests
+- 56 unit tests
 
 Not yet verified end to end, and it needs a signed build to check:
 
-- **actual per-app gain and mute.** This is the whole point of the project. The
-  measurement path exists and works — `Scripts/verify-gain.sh` above measures the
-  level at unity, half, muted and restored — but it cannot report a real number
-  until Screen & System Audio Recording is granted, and that grant does not
-  survive a rebuild while the app is ad-hoc signed with `TeamIdentifier=not set`.
-  So the last run reads `inconclusive: nothing measured at unity`, which is a
-  statement about permission, not about gain.
+- **actual per-app gain and mute, heard.** The arithmetic is verified against the
+  real mix path in `GainPathTests`, so what the slider does to samples is settled.
+  What is not verified is the last link: that Core Audio delivers tapped samples
+  to a signed, permitted build. The measurement path exists and works —
+  `Scripts/verify-gain.sh` above reports the level at unity, half, muted and
+  restored — but on this machine it reads `inconclusive: nothing measured at
+  unity`, because TCC will not grant audio capture to an ad-hoc build. Taps are
+  created, the app never appears in the System Settings list, and macOS writes
+  nothing at all to its own TCC log about it. Verifying this needs a build with a
+  Team ID, which needs a signing identity that this machine does not have.
 
 Known limitations:
 

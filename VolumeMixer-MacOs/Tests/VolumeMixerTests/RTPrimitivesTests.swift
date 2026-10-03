@@ -446,11 +446,13 @@ struct AtomicFlagTests {
 @Suite("Mixer summation")
 struct MonoDestinationTests {
 
-    @Test("a mono destination takes the left channel instead of doubling it")
+    @Test("a mono destination sums the pair instead of dropping a channel")
     func monoStrideOne() {
-        // Two interleaved stereo frames, one-buffer mono destination: the right
-        // channel has nowhere to go, so only the left samples are added and the
-        // tail of the destination is left untouched.
+        // Two interleaved stereo frames, one-buffer mono destination. The right
+        // channel has nowhere to go, so it is folded into the left rather than
+        // discarded: a mono device losing the right channel is a fault nobody
+        // hears until something is plugged into a mono output. The tail of the
+        // destination is left untouched.
         let source: [Float] = [1, 0.25, 0.5, 0.125]
         var destination: [Float] = [10, 20, 30, 40]
         source.withUnsafeBufferPointer { input in
@@ -459,7 +461,23 @@ struct MonoDestinationTests {
                                       into: out.baseAddress!, limit: out.count, stride: 1)
             }
         }
-        #expect(destination == [11, 20.5, 30, 40])
+        #expect(destination == [11.25, 20.625, 30.0, 40.0])
+    }
+
+    @Test("a mono destination never writes the same sample twice")
+    func monoDoesNotDouble() {
+        // The reason stride exists: without it a single buffer would be treated
+        // as interleaved stereo, each sample written to two places, and mono
+        // output would come out doubled.
+        let source: [Float] = [1, 1, 1, 1]
+        var destination: [Float] = [0, 0, 0, 0]
+        source.withUnsafeBufferPointer { input in
+            destination.withUnsafeMutableBufferPointer { out in
+                accumulateInterleaved(input.baseAddress!, count: input.count,
+                                      into: out.baseAddress!, limit: out.count, stride: 1)
+            }
+        }
+        #expect(destination == [2, 2, 0, 0])
     }
 
     @Test("stereo stride is unchanged")
