@@ -3,9 +3,9 @@ import Foundation
 /// Per-app levels, persisted across launches and keyed by bundle ID.
 ///
 /// Identity is the bundle ID rather than the PID, because a PID changes every
-/// time an app restarts while the bundle ID does not. Apps with no bundle ID
-/// (helper audio processes, command-line players) fall back to their PID and
-/// are intentionally not persisted -- there is no stable key for them.
+/// time an app restarts while the bundle ID does not. A process with no bundle ID
+/// is keyed by its executable path, which is stable across launches. Only the
+/// last-resort PID key is dropped on save.
 struct Settings: Codable {
 
     struct AppLevel: Codable, Equatable {

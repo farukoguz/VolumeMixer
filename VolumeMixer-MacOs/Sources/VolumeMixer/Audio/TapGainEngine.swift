@@ -230,6 +230,11 @@ final class TapGainEngine: GainEngine {
     /// a non-zero sample, which is how audio-capture denial looks from here.
     private var silentTicks = 0
     private var watchdogTimer: DispatchSourceTimer?
+    /// `quit()` stops the model and `applicationWillTerminate` stops it again,
+    /// so shutdown has to survive being called twice. It also has to make later
+    /// attaches impossible: a tap created after the watchdog is gone would mute
+    /// an app with no way left to release it.
+    private var isShutDown = false
     private let watchdogInterval: TimeInterval = 1.0
 
     /// The level the user chose per app, held separately from mute so that
@@ -265,7 +270,7 @@ final class TapGainEngine: GainEngine {
     func attach(to app: AudioApp) {
         let appID = channelID(for: app)
         controlQueue.async { [weak self] in
-            guard let self else { return }
+            guard let self, !self.isShutDown else { return }
             self.stateLock.withLock {
                 guard self.channels[appID] == nil else { return }
 
@@ -351,6 +356,7 @@ final class TapGainEngine: GainEngine {
     var liveAppIDs: Set<String> { stateLock.withLock { Set(channels.keys) } }
 
     func shutdown() {
+        stateLock.withLock { isShutDown = true }
         watchdogTimer?.cancel()
         watchdogTimer = nil
         // Never call this from the control queue: `sync` onto a queue that is
@@ -370,9 +376,11 @@ final class TapGainEngine: GainEngine {
         }
     }
 
-    func channelID(for app: AudioApp) -> String {
-        app.bundleID.isEmpty ? "pid-\(app.pid)" : app.bundleID
-    }
+    /// Identity comes from `AudioApp` so that the engine, the UI and the
+    /// settings file cannot disagree about what a given app is called. They did
+    /// once, and a command-line player ended up attached under a PID key while
+    /// the UI believed it was keyed by path.
+    func channelID(for app: AudioApp) -> String { app.id }
 
     // MARK: - Preflight
 
@@ -609,6 +617,7 @@ final class TapGainEngine: GainEngine {
     }
 
     private func checkMixerHealth() {
+        guard !isShutDown else { return }
         detectPermissionDenial()
         guard mixerProcID != nil else { return }
         let now = mixerCycles.value

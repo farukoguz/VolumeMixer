@@ -1,5 +1,6 @@
-import CoreAudio
+import AppKit
 import AudioToolbox
+import CoreAudio
 import Foundation
 
 /// Typed wrappers over the Core Audio HAL.
@@ -112,6 +113,31 @@ enum HAL {
 
     static func bundleID(of object: AudioObjectID) -> String? {
         readString(object, kAudioProcessPropertyBundleID)
+    }
+
+    /// Absolute path of a process's executable. This is the only stable identity
+    /// a process without a bundle ID has: command-line players such as `afplay`
+    /// have no bundle, and their PID changes on every launch.
+    static func executablePath(of object: AudioObjectID) -> String? {
+        guard let pid = pid(of: object) else { return nil }
+        return executablePath(ofProcess: pid)
+    }
+
+    /// `proc_pidpath` rather than `NSRunningApplication`, because LaunchServices
+    /// knows nothing about a plain command-line process: for `afplay` both
+    /// `localizedName` and `executableURL` come back nil, which would leave such
+    /// apps named "Process 95736" and identified only by a PID that is dead the
+    /// next launch. Falls back to LaunchServices for the cases `proc_pidpath`
+    /// refuses, such as a process we do not own.
+    static func executablePath(ofProcess pid: pid_t) -> String? {
+        let capacity = Int(PATH_MAX)
+        let buffer = UnsafeMutablePointer<CChar>.allocate(capacity: capacity)
+        defer { buffer.deallocate() }
+        buffer.initialize(repeating: 0, count: capacity)
+        if proc_pidpath(pid, buffer, UInt32(capacity)) > 0 {
+            return String(cString: buffer)
+        }
+        return NSRunningApplication(processIdentifier: pid)?.executableURL?.path
     }
 
     // MARK: - Devices

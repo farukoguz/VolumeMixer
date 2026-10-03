@@ -47,7 +47,8 @@ in `UserDefaults`, because tap creation is the only thing macOS evaluates and
 running it every launch would ask every launch. Every later launch goes straight to
 per-app taps, which reuse whatever was granted: grant access in System Settings and
 the next launch works with no further prompting, and the **Retry** button
-deliberately does not re-ask either.
+deliberately does not re-ask either. The preflight runs off the main thread, since
+creating a tap is a HAL round trip that must not hold up launch.
 
 TCC denial is reported as *success* at every API call site: taps are created, the
 aggregate device starts, and the buffers contain zeros. VolumeMixer therefore
@@ -73,6 +74,12 @@ default output ◀── tap-only aggregate device ◀── one mixer IOProc �
   installs `AudioObjectAddPropertyListenerBlock` for start/remove notifications,
   polls every 2s, verifies liveness with `kill(pid, 0)`, and excludes its own PID.
   This is what makes command-line players such as `afplay` show up.
+- **Identity** (`Audio/AudioApp.swift`) is bundle ID, else executable path, else PID
+  — one definition used by the engine, the UI and the settings file alike. The path
+  comes from `proc_pidpath`, because LaunchServices knows nothing about a plain
+  command-line process: for `afplay` both `localizedName` and `executableURL` are
+  nil, which would otherwise leave it named "Process 95736" and keyed by a PID that
+  is dead on the next launch. Only the last-resort PID key is refused on save.
 - **Tap** (`Audio/TapGainEngine.swift`) — one `CATapDescription(
   stereoMixdownOfProcesses:)` per app, plus one private aggregate device that is
   *only* the taps. The physical output device is never a subdevice: putting a tap
@@ -102,7 +109,7 @@ default output ◀── tap-only aggregate device ◀── one mixer IOProc �
 
 ## Tests
 
-`swift test` runs 33 tests covering what can be verified without audio hardware or
+`swift test` runs 40 tests covering what can be verified without audio hardware or
 permission:
 
 - ring buffer: write/read, wraparound, overwrite-on-overrun, frame accounting
@@ -113,6 +120,7 @@ permission:
   each other instead of adding
 - mono destination handling, where a naive stereo stride would double every sample
 - stream-format acceptance, including integer, unpacked and surround rejections
+- app identity, and that a PID key is never persisted
 
 ## Current status
 
@@ -124,7 +132,8 @@ Verified by running against real hardware:
 - silence-based permission-denial detection and tap release
 - the real tap format passing validation
 - the permission prompt appearing once and not again
-- 33 unit tests
+- a command-line player attaching under `path-/usr/bin/afplay`
+- 40 unit tests
 
 Not yet verified end to end, and it needs a signed build to check:
 
@@ -137,8 +146,8 @@ Not yet verified end to end, and it needs a signed build to check:
 
 Known limitations:
 
-- per-app levels are keyed by process, so an app's level does not follow it across
-  launches or to a second instance
+- two instances of the same command-line binary share one level, since identity is
+  the executable path
 - device channels that are not float32 are rejected rather than converted
 - per-app volume does not affect an app's own offline rendering or DRM output
 

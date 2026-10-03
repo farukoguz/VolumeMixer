@@ -17,7 +17,7 @@ final class AppModel: ObservableObject {
         var muted: Bool
         var peak: Float
         var live: Bool
-        var id: String { app.bundleID.isEmpty ? "pid-\(app.pid)" : app.bundleID }
+        var id: String { app.id }
     }
 
     // MARK: Published state
@@ -85,8 +85,18 @@ final class AppModel: ObservableObject {
             // Recorded before the tap is created, so being killed mid-preflight
             // cannot leave us asking again on the next launch.
             PermissionState.hasRequestedAudioCapture = true
-            let preflight = tapEngine.preflight()
-            if case .failed = preflight { engineStatus = preflight }
+            // Creating and destroying a tap is a round trip into the HAL, which
+            // can take tens of milliseconds and may block behind a device that
+            // is slow to wake. Launch must not wait on it, so the check runs
+            // alongside startup and reports back.
+            let preflightQueue = DispatchQueue(label: "com.volumemixer.preflight")
+            preflightQueue.async { [weak self] in
+                let result = tapEngine.preflight()
+                guard case .failed = result else { return }
+                Task { @MainActor [weak self] in
+                    self?.engineStatus = result
+                }
+            }
         }
 
         discovery.start()
@@ -126,7 +136,7 @@ final class AppModel: ObservableObject {
         next.reserveCapacity(apps.count)
 
         for app in apps {
-            let id = app.bundleID.isEmpty ? "pid-\(app.pid)" : app.bundleID
+            let id = app.id
             let saved = settings.level(for: id)
             // A level is only shown as user-set if it was actually persisted;
             // otherwise the app is at unity.
@@ -148,8 +158,7 @@ final class AppModel: ObservableObject {
     private func syncEngineAttachments(for apps: [AudioApp]) {
         var desired: [String: AudioApp] = [:]
         for app in apps {
-            let id = app.bundleID.isEmpty ? "pid-\(app.pid)" : app.bundleID
-            desired[id] = app
+            desired[app.id] = app
         }
 
         for id in attachedIDs where desired[id] == nil {
