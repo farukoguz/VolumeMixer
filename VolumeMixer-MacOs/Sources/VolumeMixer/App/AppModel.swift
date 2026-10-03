@@ -87,9 +87,12 @@ final class AppModel: ObservableObject {
     // MARK: - Lifecycle
 
     func start() {
-        // Ask macOS about audio capture once per install, before anything is
-        // listening, so the prompt has a chance to appear at launch. Every
-        // later launch reuses the existing grant instead of asking again.
+        // Check once per install that audio capture is available at all, before
+        // anything is listening, so a machine that cannot support it says so
+        // early. Every later launch reuses the existing grant instead. This is an
+        // availability check, not a permission check: whether access was granted
+        // can only be observed by inspecting samples, because a refused tap still
+        // reports success.
         if let tapEngine = engine as? TapGainEngine, !PermissionState.hasRequestedAudioCapture {
             // Recorded before the tap is created, so being killed mid-preflight
             // cannot leave us asking again on the next launch.

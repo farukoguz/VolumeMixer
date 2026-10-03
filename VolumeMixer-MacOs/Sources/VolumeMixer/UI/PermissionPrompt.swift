@@ -45,7 +45,8 @@ enum PermissionPrompt {
         Screen & System Audio Recording is off, so VolumeMixer cannot change \
         anything yet. Your other apps keep working normally either way.
 
-        Grant it in System Settings, then come back and press Try Again.
+        Add VolumeMixer to that list with the + button, turn it on, then press
+        Try Again here.
         """
         alert.addButton(withTitle: "Open System Settings")
         alert.addButton(withTitle: "Try Again")

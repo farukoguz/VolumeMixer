@@ -1,18 +1,17 @@
 import Foundation
 
-/// Remembers that the Screen & System Audio Recording prompt has already been
-/// shown.
+/// Remembers that VolumeMixer has already asked for audio capture.
 ///
-/// The preflight tap is the only thing in this app that can make macOS display
-/// that prompt, because tap creation is what TCC evaluates. macOS keys the
-/// decision to the bundle's identity, so running the preflight on every launch
-/// would ask again on every launch -- the behaviour that makes permission
-/// dialogs feel broken.
+/// The flag exists so the app does not poke TCC on every launch. It is not what
+/// makes macOS prompt: creating a process tap returns `noErr` whether or not
+/// access was granted, so a tap cannot reliably provoke the dialog. On a build
+/// with no signing identity TCC declines without a dialog and without adding the
+/// app to System Settings at all, which is why the app also carries its own
+/// alert rather than trusting a prompt to appear.
 ///
-/// Once the prompt has been shown, taps simply reuse whatever was granted: a
-/// user who grants access in System Settings starts working on the next launch
-/// without another prompt, and a user who denied it keeps system audio working
-/// because the taps get released.
+/// Once the flag is set, taps simply reuse whatever was granted: a user who
+/// grants access in System Settings starts working without another prompt, and a
+/// user who did not keeps system audio working because the taps get released.
 ///
 /// This lives in `UserDefaults` rather than `settings.json` because it is
 /// operational state, not a user preference, and because it must survive even if
