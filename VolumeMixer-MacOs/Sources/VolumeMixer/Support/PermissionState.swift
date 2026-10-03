@@ -20,9 +20,30 @@ import Foundation
 enum PermissionState {
 
     private static let key = "hasRequestedAudioCapture"
+    private static let declinedAtKey = "audioCapturePromptDeclinedAt"
 
     static var hasRequestedAudioCapture: Bool {
         get { UserDefaults.standard.bool(forKey: key) }
         set { UserDefaults.standard.set(newValue, forKey: key) }
+    }
+
+    /// When the user last dismissed our own permission alert.
+    ///
+    /// This is separate from `hasRequestedAudioCapture` because the two record
+    /// different things. That flag says macOS was asked once and now remembers the
+    /// answer; this says the user looked at the alert and chose to come back
+    /// later. Keeping them apart is what lets the app stay visible about the
+    /// permission without re-asking on every launch.
+    static var lastDeclinedAt: Date? {
+        get { UserDefaults.standard.object(forKey: declinedAtKey) as? Date }
+        set { UserDefaults.standard.set(newValue, forKey: declinedAtKey) }
+    }
+
+    static func declinePrompt() {
+        lastDeclinedAt = Date()
+    }
+
+    static func clearDecline() {
+        lastDeclinedAt = nil
     }
 }

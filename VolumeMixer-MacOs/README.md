@@ -50,6 +50,21 @@ the next launch works with no further prompting, and the **Retry** button
 deliberately does not re-ask either. The preflight runs off the main thread, since
 creating a tap is a HAL round trip that must not hold up launch.
 
+**The app tells you itself.** Because it lives in the menu bar, the panel banner
+is a poor place to discover that the app cannot work, so the app also puts up an
+alert of its own: it appears as soon as capture is known to be unavailable, comes
+to the front even though the app has no windows, and offers **Open System
+Settings**, **Try Again**, and **Not Now**. The alert is not macOS's prompt, and
+macOS still decides whether to show that one; this is the surface that survives the
+prompt being missed. Declining puts it off for three days rather than forever, so
+it cannot become nagging, and **Retry** clears the pause because asking again is a
+deliberate act.
+
+One honest limitation: denial can only be *observed* when an app is actually
+playing, because silence from a permitted tap and silence from a refused one look
+identical until there is audio to look at. The alert therefore appears the first
+time something plays without permission, not at launch.
+
 TCC denial is reported as *success* at every API call site: taps are created, the
 aggregate device starts, and the buffers contain zeros. VolumeMixer therefore
 decides permission by inspecting samples — five consecutive seconds of taps that

@@ -104,6 +104,7 @@ final class AppModel: ObservableObject {
                 guard case .failed = result else { return }
                 Task { @MainActor [weak self] in
                     self?.engineStatus = result
+                    self?.presentPermissionAlert()
                 }
             }
         }
@@ -357,6 +358,13 @@ final class AppModel: ObservableObject {
         // detectable by inspecting samples, so it is discovered asynchronously.
         if engine.availability != engineStatus {
             engineStatus = engine.availability
+            // Denial is only visible once samples arrive, so this is the first
+            // moment the app can say anything useful about it. Surfacing it here
+            // rather than only in the panel is the point: by now the user has
+            // usually already concluded the app just does not work.
+            if case .permissionDenied = engine.availability {
+                presentPermissionAlert()
+            }
         }
         // Before the empty-channels guard: a model with nothing audible can still
         // be holding a tap through its grace period.
@@ -423,6 +431,17 @@ final class AppModel: ObservableObject {
         persist()
     }
 
+    /// Shows the permission alert, unless the user recently dismissed it.
+    ///
+    /// Deliberately allowed to appear on every launch while permission is
+    /// missing: the app cannot do its one job without it, and a silent app is
+    /// worse than a slightly persistent one. `PermissionPrompt` owns the backoff.
+    func presentPermissionAlert() {
+        PermissionPrompt.presentIfDue { [weak self] in
+            Task { @MainActor in self?.retryGainControl() }
+        }
+    }
+
     /// Re-attempts per-app gain after the user has granted Screen & System Audio
     /// Recording. Taps are torn down and rebuilt from scratch, because a tap that
     /// was created while capture was denied cannot start delivering samples
@@ -435,6 +454,8 @@ final class AppModel: ObservableObject {
     /// up on the next attempt.
     func retryGainControl() {
         guard let tapEngine = engine as? TapGainEngine else { return }
+        // Asking again is a deliberate act, so it clears any earlier dismissal.
+        PermissionPrompt.retryRequested()
         tapEngine.resetAfterDenial()
         engineStatus = .ready
 
@@ -450,8 +471,7 @@ final class AppModel: ObservableObject {
     /// permission prompt (which macOS only shows on demand, if at all) does not
     /// have to be hunted for.
     func openPrivacySettings() {
-        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture") else { return }
-        NSWorkspace.shared.open(url)
+        PermissionPrompt.openSettings()
     }
 
     func quit() {
