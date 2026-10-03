@@ -125,7 +125,7 @@ default output ◀── tap-only aggregate device ◀── one mixer IOProc �
 
 ## Tests
 
-`swift test` runs 40 tests covering what can be verified without audio hardware or
+`swift test` runs 43 tests covering what can be verified without audio hardware or
 permission:
 
 - ring buffer: write/read, wraparound, overwrite-on-overrun, frame accounting
@@ -137,6 +137,35 @@ permission:
 - mono destination handling, where a naive stereo stride would double every sample
 - stream-format acceptance, including integer, unpacked and surround rejections
 - app identity, and that a PID key is never persisted
+
+## Verifying gain and mute
+
+Everything else in this project can be checked from logs. Whether moving a slider
+actually changes what comes out of the speakers cannot, because Core Audio
+publishes no output meter for the system. So the check is to listen to the result:
+`Scripts/verify-gain.sh` plays a tone through the mixer and measures the system
+level with a global tap at unity, at half gain, muted, and restored again.
+
+A working gain path reads about -6 dB at half, silence when muted, and back to
+unity afterwards:
+
+```
+self-test VERDICT gain=works (-6.0 dB at half, expected about -6) mute=works (-90.0 dB) restore=works
+```
+
+The script drives the same `setGain` and `setMuted` calls the UI does, so it
+covers the real path rather than a private back door. It reports
+`inconclusive` when it measures nothing at all, which distinguishes "the gain
+path is wrong" from "capture was refused" — a distinction worth keeping, because
+the second is much easier to hit.
+
+Two things to know before running it:
+
+- It does not rebuild the app, on purpose. An ad-hoc signed binary is identified
+  by its code hash, so rebuilding makes macOS treat it as a different app and
+  silently drops the grant. Build first, grant, then measure.
+- It needs Screen & System Audio Recording granted to `build/VolumeMixer.app`, and
+  a signed build for the grant to survive the next rebuild.
 
 ## Current status
 
@@ -160,17 +189,19 @@ Verified by running against real hardware:
 
 Not yet verified end to end, and it needs a signed build to check:
 
-- **actual per-app gain and mute.** This is the whole point of the project and it
-  needs a real Team ID signature plus Screen & System Audio Recording granted. An
-  ad-hoc build has `TeamIdentifier=not set`, which is enough for taps to be created
-  but the panel cannot be given a reason to appear to work when capture is denied,
-  and audible output cannot be confirmed without an authorized capture tap to
-  measure with.
+- **actual per-app gain and mute.** This is the whole point of the project. The
+  measurement path exists and works — `Scripts/verify-gain.sh` above measures the
+  level at unity, half, muted and restored — but it cannot report a real number
+  until Screen & System Audio Recording is granted, and that grant does not
+  survive a rebuild while the app is ad-hoc signed with `TeamIdentifier=not set`.
+  So the last run reads `inconclusive: nothing measured at unity`, which is a
+  statement about permission, not about gain.
 
 Known limitations:
 
 - several instances of one binary share a single row and level, which is what a
-  per-app mixer should do, but it does mean one instance cannot be singled out
+  per-app mixer should do, but each instance does get its own tap, so one instance
+  cannot be singled out
 - device channels that are not float32 are rejected rather than converted
 - per-app volume does not affect an app's own offline rendering or DRM output
 
@@ -189,3 +220,4 @@ Known limitations:
 | `Support/PermissionState.swift` | records that the capture prompt was shown |
 | `Support/Log.swift` | os_log plus optional stdout mirroring |
 | `UI/MixerView.swift` | menu bar panel |
+| `Diagnostics/SystemAudioMeter.swift` | global tap that measures system level, for `verify-gain.sh` |

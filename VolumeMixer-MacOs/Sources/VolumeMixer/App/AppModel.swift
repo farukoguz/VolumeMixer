@@ -120,6 +120,118 @@ final class AppModel: ObservableObject {
         }
         RunLoop.main.add(timer, forMode: .common)
         meterTimer = timer
+
+        runGainSelfTestIfRequested()
+    }
+
+    /// Numeric verification of the gain path, run only when `VM_SELFTEST` is set.
+    ///
+    /// Everything else this app does can be confirmed from logs; whether moving a
+    /// slider actually changes what comes out of the speakers cannot, because Core
+    /// Audio publishes no output meter. So this listens to the system through a
+    /// global tap and prints the level it measures at each step, driving the same
+    /// code path the UI does.
+    ///
+    /// Temporary: remove once the gain path has been confirmed on hardware.
+    private func runGainSelfTestIfRequested() {
+        guard ProcessInfo.processInfo.environment["VM_SELFTEST"] != nil else { return }
+
+        let meter = SystemAudioMeter()
+        guard meter.start() else {
+            Log.error("self-test: cannot measure, so gain cannot be verified")
+            return
+        }
+
+        let queue = DispatchQueue(label: "com.volumemixer.selftest")
+        queue.async { [weak self] in
+            guard let self else { return }
+            // Let discovery find the audible apps and the taps come up.
+            Thread.sleep(forTimeInterval: 6)
+
+            let identity = self.firstChannelID()
+            guard identity != nil else {
+                Log.error("self-test: nothing is playing, so there is nothing to measure")
+                meter.stop()
+                return
+            }
+            Log.lifecycle("self-test: measuring \(identity!)")
+
+            let unity = self.measure(meter, label: "unity", seconds: 4)
+            self.applyGain(0.5)
+            let half = self.measure(meter, label: "half", seconds: 4)
+            self.applyMuted(true)
+            let muted = self.measure(meter, label: "muted", seconds: 3)
+            self.applyMuted(false)
+            self.applyGain(1)
+            let restored = self.measure(meter, label: "restored", seconds: 3)
+
+            self.report(unity: unity, half: half, muted: muted, restored: restored)
+            meter.stop()
+        }
+    }
+
+    @MainActor
+    private func firstChannelID() -> String? { channels.first?.id }
+
+    /// Applies a level through the same path the slider uses, so the test covers
+    /// the real code and not a private back door.
+    private func applyGain(_ gain: Float) {
+        Task { @MainActor [weak self] in
+            guard let self, let id = self.firstChannelID() else { return }
+            self.setGain(gain, for: id)
+        }
+    }
+
+    private func applyMuted(_ muted: Bool) {
+        Task { @MainActor [weak self] in
+            guard let self, let id = self.firstChannelID() else { return }
+            self.setMuted(muted, for: id)
+        }
+    }
+
+    /// Samples the meter once a second, returning the loudest reading. Peak rather
+    /// than mean, so a gap between windows cannot hide a working level.
+    private func measure(_ meter: SystemAudioMeter, label: String, seconds: Int) -> Float {
+        var loudest: Float = 0
+        for _ in 0..<seconds {
+            Thread.sleep(forTimeInterval: 1)
+            loudest = max(loudest, meter.rms)
+            let decibels = meter.rms > 0.000_001 ? 20 * log10(meter.rms) : -120
+            Log.lifecycle(String(format: "self-test: %@ rms=%.4f (%.1f dB)", label, meter.rms, decibels))
+        }
+        return loudest
+    }
+
+    private func report(unity: Float, half: Float, muted: Float, restored: Float) {
+        func decibels(_ value: Float) -> Float {
+            value > 0.000_001 ? 20 * log10(value) : -120
+        }
+        Log.lifecycle(String(format: "self-test RESULT unity=%.4f (%.1f dB)", unity, decibels(unity)))
+        Log.lifecycle(String(format: "self-test RESULT half=%.4f (%.1f dB)", half, decibels(half)))
+        Log.lifecycle(String(format: "self-test RESULT muted=%.4f (%.1f dB)", muted, decibels(muted)))
+        Log.lifecycle(String(format: "self-test RESULT restored=%.4f (%.1f dB)", restored, decibels(restored)))
+
+        // The verdict, stated as the arithmetic rather than a pass/fail nobody can
+        // argue with: a working gain path halves the level at 0.5 and silences it
+        // when muted, then comes back.
+        let halfDelta = decibels(half) - decibels(unity)
+        let mutedDelta = decibels(muted) - decibels(unity)
+        let restoredDelta = decibels(restored) - decibels(unity)
+        guard unity > 0.000_001 else {
+            // Nothing to compare against, so no verdict. Reporting "gain=WRONG"
+            // here would blame the gain path for a capture problem.
+            Log.error("self-test VERDICT inconclusive: nothing measured at unity. "
+                      + "Screen & System Audio Recording is not granted for this build.")
+            return
+        }
+        let gainWorks = halfDelta < -2.0 && halfDelta > -10.0
+        let muteWorks = mutedDelta < -40.0
+        let restoreWorks = abs(restoredDelta) < 3.0
+        Log.lifecycle("self-test VERDICT gain=\(gainWorks ? "works" : "WRONG") "
+                      + "(\(String(format: "%.1f", halfDelta)) dB at half, expected about -6) "
+                      + "mute=\(muteWorks ? "works" : "WRONG") "
+                      + "(\(String(format: "%.1f", mutedDelta)) dB) "
+                      + "restore=\(restoreWorks ? "works" : "WRONG")")
     }
 
     func stop() {
@@ -283,7 +395,11 @@ final class AppModel: ObservableObject {
 
     func toggleMute(for id: String) {
         guard let index = channels.firstIndex(where: { $0.id == id }) else { return }
-        let muted = !channels[index].muted
+        setMuted(!channels[index].muted, for: id)
+    }
+
+    func setMuted(_ muted: Bool, for id: String) {
+        guard let index = channels.firstIndex(where: { $0.id == id }) else { return }
         channels[index].muted = muted
         engine.setMuted(muted, for: id)
         var updated = settings
