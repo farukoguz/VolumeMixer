@@ -35,8 +35,23 @@ if ! plutil -extract NSAudioCaptureUsageDescription raw "$APP/Contents/Info.plis
 fi
 echo "    NSAudioCaptureUsageDescription present OK"
 
-echo "==> codesigning (ad-hoc)"
-codesign --force --sign - --timestamp=none "$APP" 2>&1 | sed 's/^/    /'
+# Prefer a real signing identity, because macOS will not grant Screen & System
+# Audio Recording to an ad-hoc build: taps are created, every buffer is zero, and
+# nothing anywhere reports a refusal. An app with no Team ID is anonymous as far
+# as TCC is concerned, so there is nothing for the user to grant it in.
+SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
+    | grep -E '"(Apple Development|Developer ID Application|Mac App Distribution)' \
+    | head -1 | sed -E 's/^[^"]*"(.*)"$/\1/')"
+
+if [ -n "$SIGN_IDENTITY" ]; then
+    echo "==> codesigning ($SIGN_IDENTITY)"
+    codesign --force --sign "$SIGN_IDENTITY" --timestamp=none "$APP" 2>&1 | sed 's/^/    /'
+else
+    echo "==> codesigning (ad-hoc, no identity found)"
+    echo "    !! Screen & System Audio Recording cannot be granted to this build."
+    echo "    !! Add a signing identity, or gain will stay unverifiable."
+    codesign --force --sign - --timestamp=none "$APP" 2>&1 | sed 's/^/    /'
+fi
 codesign --verify --verbose=1 "$APP" 2>&1 | sed 's/^/    /'
 
 echo "==> done: $APP"

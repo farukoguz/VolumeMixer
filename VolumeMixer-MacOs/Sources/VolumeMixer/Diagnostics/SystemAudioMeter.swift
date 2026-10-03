@@ -10,7 +10,8 @@ import Foundation
 /// tap is the same mechanism the engine already uses per app, and it is not
 /// played back anywhere, so it cannot influence what is measured.
 ///
-/// Temporary: remove once the gain path has been confirmed on hardware.
+/// Kept rather than deleted after a successful run: it is the only way to check
+/// the feature that matters, so it is what the next change gets verified with.
 final class SystemAudioMeter {
 
     /// Most recent window's RMS. Written on the tap thread, read from the sweep.

@@ -22,7 +22,11 @@ swift test             # 24 tests, no hardware required
 open build/VolumeMixer.app
 ```
 
-`Scripts/build-app.sh` builds a real `.app` bundle and ad-hoc signs it. The bundle is
+`Scripts/build-app.sh` builds a real `.app` bundle and signs it with the first
+signing identity in the keychain, falling back to ad-hoc with a warning if there
+is none. That distinction decides whether the app can work at all: macOS will not
+grant Screen & System Audio Recording to a build with no Team ID, so an unsigned
+build looks fine right up until it silently produces silence. The bundle is
 mandatory, not cosmetic: macOS gates process taps on the `kTCCServiceAudioCapture`
 TCC service, which is keyed on the bundle's `Info.plist` and code signature. Running
 the bare SwiftPM binary gives you a *silent* tap — every Core Audio call returns
@@ -180,11 +184,16 @@ covers the real path rather than a private back door. It reports
 path is wrong" from "capture was refused" — a distinction worth keeping, because
 the second is much easier to hit.
 
+It is off unless `VM_SELFTEST` is set, and it is kept in the tree rather than
+deleted after a successful run: it is the only way to check the feature that
+matters, so throwing it away would leave nothing to re-verify with after the next
+change.
+
 Two things to know before running it:
 
-- It does not rebuild the app, on purpose. An ad-hoc signed binary is identified
-  by its code hash, so rebuilding makes macOS treat it as a different app and
-  silently drops the grant. Build first, grant, then measure.
+- It does not rebuild the app, on purpose. A build signed with a throwaway
+  identity is identified by its code hash, so rebuilding makes macOS treat it as a
+  different app and silently drops the grant. Build first, grant, then measure.
 - It needs Screen & System Audio Recording granted to `build/VolumeMixer.app`, and
   a signed build for the grant to survive the next rebuild.
 
@@ -208,18 +217,35 @@ Verified by running against real hardware:
 - a command-line player attaching under `path-/usr/bin/afplay`
 - 56 unit tests
 
-Not yet verified end to end, and it needs a signed build to check:
+Still open:
 
 - **actual per-app gain and mute, heard.** The arithmetic is verified against the
   real mix path in `GainPathTests`, so what the slider does to samples is settled.
-  What is not verified is the last link: that Core Audio delivers tapped samples
-  to a signed, permitted build. The measurement path exists and works —
-  `Scripts/verify-gain.sh` above reports the level at unity, half, muted and
-  restored — but on this machine it reads `inconclusive: nothing measured at
-  unity`, because TCC will not grant audio capture to an ad-hoc build. Taps are
-  created, the app never appears in the System Settings list, and macOS writes
-  nothing at all to its own TCC log about it. Verifying this needs a build with a
-  Team ID, which needs a signing identity that this machine does not have.
+  What is unverified is the last link: that Core Audio delivers tapped samples to
+  a permitted build. `Scripts/verify-gain.sh` above reports the level at unity,
+  half, muted and restored, and still reads `inconclusive: nothing measured at
+  unity` on this machine — the grant has not been turned on in System Settings.
+
+  Everything needed for that grant is now in place: the app is signed with a Team
+  ID, which is the condition macOS actually enforces. While the build was ad-hoc,
+  TCC would not grant this permission at all — taps were created, every buffer
+  was zero, the app never appeared in the list, and nothing reported a refusal.
+  One toggle in System Settings is all that is left.
+
+### Signing notes
+
+Two things cost real time here and are worth writing down:
+
+- **An ad-hoc build cannot be granted this permission.** `TeamIdentifier=not set`
+  leaves macOS with no developer to attribute the app to. The failure is silent,
+  so it is worth checking `codesign -dv` before blaming the audio path.
+- **An imported certificate needs its intermediate.** Importing a `.p12` can
+  report success and still leave `security find-identity` showing zero valid
+  identities, with `CSSMERR_TP_NOT_TRUSTED`, because the
+  Apple Worldwide Developer Relations intermediate is not in the keychain. Xcode
+  normally installs it as a side effect of creating certificates, so an
+  out-of-band import has to fetch it from `apple.com/certificateauthority` and
+  install it too, or codesign cannot build a chain.
 
 Known limitations:
 

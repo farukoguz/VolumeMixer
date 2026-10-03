@@ -136,7 +136,6 @@ final class AppModel: ObservableObject {
     /// global tap and prints the level it measures at each step, driving the same
     /// code path the UI does.
     ///
-    /// Temporary: remove once the gain path has been confirmed on hardware.
     private func runGainSelfTestIfRequested() {
         guard ProcessInfo.processInfo.environment["VM_SELFTEST"] != nil else { return }
 
