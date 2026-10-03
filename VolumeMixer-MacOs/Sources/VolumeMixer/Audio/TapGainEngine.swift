@@ -30,9 +30,11 @@ final class TapChannel {
     /// True once any non-zero sample has passed through the tap. On macOS a
     /// denied audio-capture permission looks exactly like a working pipeline
     /// that happens to produce zeros, so this is how denial is detected.
-    private(set) var sawAudio = false
-    /// Frames copied out of the tap and into the ring.
-    private(set) var framesCopied: Int64 = 0
+    /// Atomic because the watchdog reads it from another thread.
+    let sawAudio = AtomicFlag()
+    /// Frames copied out of the tap and into the ring, for the same reason.
+    let framesCounter = FrameCounter()
+    var framesCopied: Int64 { framesCounter.value }
 
     init(appID: String, processObjectID: AudioObjectID) {
         self.appID = appID
@@ -83,6 +85,17 @@ final class TapChannel {
         }
         aggregateID = newAggregateID
 
+        // `render` reinterprets the tap's buffers as Float. Confirm that first,
+        // because a mismatch would be noise rather than an error.
+        let tapFormat = HAL.streamFormat(of: aggregateID, scope: kAudioObjectPropertyScopeInput)
+        guard isSupportedMixFormat(tapFormat) else {
+            Log.error("tap \(appID) format unsupported: "
+                      + "id=\(tapFormat.mFormatID) flags=\(tapFormat.mFormatFlags) "
+                      + "bits=\(tapFormat.mBitsPerChannel) ch=\(tapFormat.mChannelsPerFrame)")
+            stop()
+            return kAudio_ParamError
+        }
+
         var newIOProc: AudioDeviceIOProcID?
         let procStatus = AudioDeviceCreateIOProcIDWithBlock(&newIOProc, aggregateID, queue) { [weak self] _, inputData, _, _, _ in
             self?.render(inputData)
@@ -132,9 +145,9 @@ final class TapChannel {
         // produces exactly that duplication.
 
         let peak = ring.writeDeinterleaved(left, right, frameCount: leftFrames)
-        framesCopied &+= Int64(leftFrames)
+        framesCounter.increment(by: Int64(leftFrames))
         if peak > 0 {
-            sawAudio = true
+            sawAudio.value = true
         }
     }
 
@@ -370,6 +383,10 @@ final class TapGainEngine: GainEngine {
     /// the user is asked while they are looking at the app, instead of the first
     /// tap silently delivering zeros later with no explanation.
     ///
+    /// Called exactly once per install -- see `PermissionState`. Every later
+    /// launch goes straight to per-app taps, which reuse the existing grant
+    /// without prompting again.
+    ///
     /// A tap that creates cleanly is not proof that capture is permitted -- TCC
     /// denial is reported as success -- so this only reports hard API failures.
     /// Whether samples actually flow is decided by inspecting them.
@@ -411,15 +428,15 @@ final class TapGainEngine: GainEngine {
         }
 
         outputFormat = HAL.outputStreamFormat(device)
-        guard outputFormat.mSampleRate > 0, outputFormat.mChannelsPerFrame > 0 else {
-            availability = .failed("invalid output format")
-            return
-        }
         // The mixer only handles float32, which covers built-in, USB and
-        // Bluetooth outputs on current macOS.
-        guard outputFormat.isFloat32 else {
-            availability = .failed("output format \(outputFormat.formatCode) is not float32")
-            Log.error("mixer format unsupported: \(outputFormat.formatCode)")
+        // Bluetooth outputs on current macOS. Anything else is refused rather
+        // than mixed as noise.
+        guard outputFormat.mSampleRate > 0, isSupportedMixFormat(outputFormat) else {
+            availability = .failed("output format \(outputFormat.mFormatID) "
+                                   + "unsupported (\(outputFormat.mChannelsPerFrame)ch, "
+                                   + "\(outputFormat.mBitsPerChannel)bit)")
+            Log.error("mixer format unsupported: id=\(outputFormat.mFormatID) "
+                      + "ch=\(outputFormat.mChannelsPerFrame) bits=\(outputFormat.mBitsPerChannel)")
             return
         }
 
@@ -489,6 +506,17 @@ final class TapGainEngine: GainEngine {
     ///
     /// Gain is applied here rather than in each tap so the meter reflects what
     /// the user set, and so a tap thread stays a pure copy that cannot glitch.
+    /// Per-cycle multiplier that makes a meter fall by roughly 20 dB per second,
+    /// derived from how many frames this cycle covered.
+    @inline(__always)
+    private var peakDecay: Float {
+        let seconds = outputFormat.mSampleRate > 0
+            ? Double(mixFramesThisCycle) / outputFormat.mSampleRate : 0
+        return Float(pow(0.1, seconds))
+    }
+
+    private var mixFramesThisCycle: Int = 512
+
     private func mix(_ outputData: UnsafeMutablePointer<AudioBufferList>) {
         mixerCycles.increment()
 
@@ -505,10 +533,17 @@ final class TapGainEngine: GainEngine {
         let first = base.load(fromByteOffset: 0, as: AudioBuffer.self)
         guard let firstData = first.mData else { return }
 
+        // One buffer means interleaved: stereo in a single buffer, or mono in a
+        // single buffer. More than one means one buffer per channel.
+        // A single buffer holds all channels interleaved. Which stride that is
+        // comes from the stream format, not the buffer list: a mono device also
+        // reports one buffer, and treating it as stereo would read half the
+        // buffer as frame count and write each sample twice.
         let interleaved = bufferCount == 1
+        let outputChannels = max(1, min(Int(outputFormat.mChannelsPerFrame), 2))
         let destination = firstData.assumingMemoryBound(to: Float.self)
         let destinationSamples = Int(first.mDataByteSize) / MemoryLayout<Float>.size
-        let frames = (interleaved ? destinationSamples / 2 : destinationSamples)
+        let frames = destinationSamples / (interleaved ? outputChannels : 1)
 
         // Clamp rather than dropping the cycle if a device ever asks for more
         // than the buffer we preallocated.
@@ -516,6 +551,10 @@ final class TapGainEngine: GainEngine {
         let usableFrames = min(frames, mixScratchCapacity / 2)
         guard usableFrames > 0 else { return }
 
+        // For a deinterleaved stereo destination the right channel lives in its
+        // own buffer. Anything else (including mono, where there is none) stays
+        // aliased to `left`, and `accumulateInterleaved` then writes each sample
+        // once instead of adding the same buffer to itself.
         var right = destination
         if !interleaved && bufferCount > 1 {
             let second = base.load(fromByteOffset: stride, as: AudioBuffer.self)
@@ -523,7 +562,9 @@ final class TapGainEngine: GainEngine {
                 right = secondData.assumingMemoryBound(to: Float.self)
             }
         }
+        let deinterleaved = !interleaved && bufferCount > 1
 
+        mixFramesThisCycle = usableFrames
         let sampleCount = usableFrames * 2
         scratch.update(repeating: 0, count: sampleCount)
 
@@ -532,13 +573,17 @@ final class TapGainEngine: GainEngine {
             let framesRead = channel.ring.read(into: scratch, frameCount: usableFrames)
             guard framesRead > 0 else { return }
 
-            channel.peak.value = scaleInPlace(scratch, count: sampleCount, gain: channel.gain.value)
+            let mixed = scaleInPlace(scratch, count: sampleCount, gain: channel.gain.value)
+            // Decay instead of latching, otherwise a meter pins at the last
+            // non-zero peak for as long as the app stays routed.
+            channel.peak.value = max(mixed, channel.peak.value * peakDecay)
 
-            if interleaved {
-                accumulateInterleaved(scratch, count: sampleCount,
-                                      into: destination, limit: destinationSamples)
-            } else {
+            if deinterleaved {
                 accumulatePlanar(scratch, frames: framesRead, left: destination, right: right)
+            } else {
+                accumulateInterleaved(scratch, count: sampleCount, into: destination,
+                                      limit: destinationSamples,
+                                      stride: deinterleaved ? 1 : outputChannels)
             }
         }
     }
@@ -589,7 +634,7 @@ final class TapGainEngine: GainEngine {
             return
         }
         let copying = channels.values.contains { $0.framesCopied > 0 }
-        let audible = channels.values.contains { $0.sawAudio }
+        let audible = channels.values.contains { $0.sawAudio.value }
         guard copying, !audible else {
             silentTicks = 0
             return

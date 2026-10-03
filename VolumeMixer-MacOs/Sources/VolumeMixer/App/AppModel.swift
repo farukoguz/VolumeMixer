@@ -78,9 +78,13 @@ final class AppModel: ObservableObject {
     // MARK: - Lifecycle
 
     func start() {
-        // Ask macOS about audio capture before anything is listening, so the
-        // permission prompt has a chance to appear at launch.
-        if let tapEngine = engine as? TapGainEngine {
+        // Ask macOS about audio capture once per install, before anything is
+        // listening, so the prompt has a chance to appear at launch. Every
+        // later launch reuses the existing grant instead of asking again.
+        if let tapEngine = engine as? TapGainEngine, !PermissionState.hasRequestedAudioCapture {
+            // Recorded before the tap is created, so being killed mid-preflight
+            // cannot leave us asking again on the next launch.
+            PermissionState.hasRequestedAudioCapture = true
             let preflight = tapEngine.preflight()
             if case .failed = preflight { engineStatus = preflight }
         }
@@ -235,6 +239,12 @@ final class AppModel: ObservableObject {
     /// Recording. Taps are torn down and rebuilt from scratch, because a tap that
     /// was created while capture was denied cannot start delivering samples
     /// afterwards.
+    /// Rebuilds the taps with whatever permission is already granted.
+    ///
+    /// Deliberately does not run the preflight: the prompt has been shown once
+    /// already, and re-asking is exactly what makes a permission flow feel
+    /// broken. Once the user has granted access in System Settings this picks it
+    /// up on the next attempt.
     func retryGainControl() {
         guard let tapEngine = engine as? TapGainEngine else { return }
         tapEngine.resetAfterDenial()

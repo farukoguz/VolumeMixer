@@ -1,3 +1,4 @@
+import CoreAudio
 import Foundation
 
 // MARK: - GainSlot
@@ -87,6 +88,39 @@ final class FrameCounter {
     @inline(__always)
     func increment() {
         storage.pointee &+= 1
+    }
+
+    @inline(__always)
+    func increment(by amount: Int64) {
+        storage.pointee &+= amount
+    }
+}
+
+// MARK: - AtomicFlag
+
+/// A single boolean shared between the tap thread and the watchdog. Written at
+/// most once per cycle from the audio side, read from the watchdog, so it has to
+/// be a real atomic rather than a stored property: a plain `Bool` would be a data
+/// race the moment the watchdog samples it mid-write.
+final class AtomicFlag {
+
+    private let storage: UnsafeMutablePointer<Int32>
+
+    init(_ value: Bool = false) {
+        storage = .allocate(capacity: 1)
+        storage.initialize(to: value ? 1 : 0)
+    }
+
+    deinit {
+        storage.deinitialize(count: 1)
+        storage.deallocate()
+    }
+
+    /// Real-time safe: aligned 32-bit access is atomic on arm64/x86-64.
+    @inline(__always)
+    var value: Bool {
+        get { storage.pointee != 0 }
+        set { storage.pointee = newValue ? 1 : 0 }
     }
 }
 
@@ -297,20 +331,31 @@ func scaleInPlace(_ samples: UnsafeMutablePointer<Float>, count: Int, gain: Floa
 
 // MARK: - Summation
 
-/// Adds interleaved stereo frames from `source` into an interleaved destination.
+/// Adds interleaved frames from `source` into an interleaved destination.
 ///
 /// `limit` is the destination's capacity in samples, which may be smaller than
 /// `count` if a device ever asks for more frames than were mixed.
+///
+/// `stride` is how many samples of destination each source frame occupies: 2 for
+/// stereo, 1 for a mono device that hands us a single buffer. Without it a mono
+/// output would be written twice and come out doubled.
 @inline(__always)
 func accumulateInterleaved(_ source: UnsafePointer<Float>,
                            count: Int,
                            into destination: UnsafeMutablePointer<Float>,
-                           limit: Int) {
-    var index = 0
-    let bound = min(count, limit)
-    while index < bound {
-        destination[index] += source[index]
-        index += 1
+                           limit: Int,
+                           stride: Int = 2) {
+    let outputStride = max(1, stride)
+    let frames = count / 2
+    let destinationFrames = limit / outputStride
+    let bound = min(frames, destinationFrames)
+    var frame = 0
+    while frame < bound {
+        destination[frame * outputStride] += source[frame * 2]
+        if outputStride > 1 {
+            destination[frame * outputStride + 1] += source[frame * 2 + 1]
+        }
+        frame += 1
     }
 }
 
@@ -327,6 +372,28 @@ func accumulatePlanar(_ source: UnsafePointer<Float>,
         right[frame] += source[frame * 2 + 1]
         frame += 1
     }
+}
+
+// MARK: - Format support
+
+/// Whether a stream format is one this engine can actually process.
+///
+/// The tap side is read with `assumingMemoryBound(to: Float.self)`, and the
+/// output side is mixed by `scaleInPlace`. Both silently produce garbage rather
+/// than failing if handed something else, so the format is checked once at setup
+/// and a mismatch refuses the tap instead of creating noise.
+func isSupportedMixFormat(_ format: AudioStreamBasicDescription) -> Bool {
+    guard format.mFormatID == kAudioFormatLinearPCM else { return false }
+    guard format.mFormatFlags & kAudioFormatFlagIsFloat != 0 else { return false }
+    // Packed is *required*, not forbidden: it means each sample is stored in a
+    // whole 32-bit container, which is what makes reading the buffer as
+    // `Float` valid. Unpacked 32-bit float would be bit-packed and garbage.
+    guard format.mFormatFlags & kAudioFormatFlagIsPacked != 0 else { return false }
+    // Interleaving is deliberately not constrained: the mixer handles both a
+    // single interleaved buffer and one buffer per channel.
+    guard format.mBitsPerChannel == 32 else { return false }
+    guard format.mChannelsPerFrame == 1 || format.mChannelsPerFrame == 2 else { return false }
+    return true
 }
 
 // MARK: - ChannelTable

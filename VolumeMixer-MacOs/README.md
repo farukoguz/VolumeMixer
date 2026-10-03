@@ -42,6 +42,13 @@ permission while you are looking at the app. Grant **Screen & System Audio
 Recording** for VolumeMixer in System Settings → Privacy & Security, then quit and
 relaunch the app.
 
+**The prompt happens once.** The preflight runs on the first launch only, recorded
+in `UserDefaults`, because tap creation is the only thing macOS evaluates and
+running it every launch would ask every launch. Every later launch goes straight to
+per-app taps, which reuse whatever was granted: grant access in System Settings and
+the next launch works with no further prompting, and the **Retry** button
+deliberately does not re-ask either.
+
 TCC denial is reported as *success* at every API call site: taps are created, the
 aggregate device starts, and the buffers contain zeros. VolumeMixer therefore
 decides permission by inspecting samples — five consecutive seconds of taps that
@@ -83,6 +90,11 @@ default output ◀── tap-only aggregate device ◀── one mixer IOProc �
 - **Lazy mixer** — no IOProc exists while no app is routed, so an idle app does not
   keep the output device awake. The mixer is rebuilt when the default device
   changes; taps survive, because they own their own clock.
+- **Formats are checked, not assumed** — the tap IOProc reinterprets buffers as
+  float, so both the tap's and the device's format are verified as packed float32
+  mono/stereo before anything starts. A mismatch is refused with a reason instead
+  of producing noise, and the mixer distinguishes a mono single-buffer device from
+  a deinterleaved stereo pair so a mono output is not summed into itself.
 - **Recovery** — the watchdog runs on its own queue, not on the control queue, so it
   can still release taps if a HAL call is stuck. Engine state shared between the
   control queue, the watchdog and the UI is guarded by a recursive lock that the
@@ -90,14 +102,17 @@ default output ◀── tap-only aggregate device ◀── one mixer IOProc �
 
 ## Tests
 
-`swift test` covers what can be verified without audio hardware or permission:
+`swift test` runs 33 tests covering what can be verified without audio hardware or
+permission:
 
 - ring buffer: write/read, wraparound, overwrite-on-overrun, frame accounting
-- lock-free slots and counters
+- lock-free slots, counters and the atomic flag
 - `ChannelTable` growth, publication, and capacity limits
 - gain scaling, including the silence-preserving and unmute cases
 - the mixer's summation contract, which is what keeps two channels from replacing
   each other instead of adding
+- mono destination handling, where a naive stereo stride would double every sample
+- stream-format acceptance, including integer, unpacked and surround rejections
 
 ## Current status
 
@@ -107,7 +122,9 @@ Verified by running against real hardware:
 - tap and aggregate-device creation and teardown, repeatedly
 - lazy mixer start, and mixer teardown when the last app goes quiet
 - silence-based permission-denial detection and tap release
-- 24 unit tests
+- the real tap format passing validation
+- the permission prompt appearing once and not again
+- 33 unit tests
 
 Not yet verified end to end, and it needs a signed build to check:
 
@@ -137,5 +154,6 @@ Known limitations:
 | `Audio/GainEngine.swift` | engine protocol, availability states |
 | `Audio/OutputDevice.swift` | default device and system volume |
 | `Support/HAL.swift` | typed Core Audio property access |
+| `Support/PermissionState.swift` | records that the capture prompt was shown |
 | `Support/Log.swift` | os_log plus optional stdout mirroring |
 | `UI/MixerView.swift` | menu bar panel |

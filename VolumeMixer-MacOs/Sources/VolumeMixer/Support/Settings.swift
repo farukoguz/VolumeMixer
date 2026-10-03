@@ -48,6 +48,10 @@ struct Settings: Codable {
     }
 
     mutating func setLevel(_ level: AppLevel, for appID: String) {
+        // A PID fallback key is worthless on the next launch, and keeping them
+        // would slowly fill the file with one dead entry per helper process that
+        // ever played audio.
+        if appID.hasPrefix("pid-") { return }
         // 1.0 unmuted is the default and not worth persisting.
         if abs(level.gain - 1) < 0.001 && !level.muted {
             apps.removeValue(forKey: appID)

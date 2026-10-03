@@ -164,8 +164,16 @@ enum HAL {
     /// The device's current output stream format. Sample rate here is the rate
     /// the mixer must run at.
     static func outputStreamFormat(_ device: AudioObjectID) -> AudioStreamBasicDescription {
+        streamFormat(of: device, scope: kAudioObjectPropertyScopeOutput)
+    }
+
+    /// The format a device delivers in the given scope. Read rather than assumed:
+    /// the tap side has to be checked because the tap IOProc reinterprets its
+    /// buffers as float, which would be noise rather than an error on a mismatch.
+    static func streamFormat(of device: AudioObjectID,
+                             scope: AudioObjectPropertyScope) -> AudioStreamBasicDescription {
         var format = AudioStreamBasicDescription()
-        _ = read(device, kAudioDevicePropertyStreamFormat, kAudioObjectPropertyScopeOutput, into: &format)
+        _ = read(device, kAudioDevicePropertyStreamFormat, scope, into: &format)
         return format
     }
 

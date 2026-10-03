@@ -1,3 +1,4 @@
+import CoreAudio
 import Foundation
 import Testing
 
@@ -416,5 +417,125 @@ struct ChannelTableTests {
         let dropped = table.publish(channels)
         #expect(dropped == 5)
         #expect(table.count == ChannelTable.capacity)
+    }
+}
+
+// MARK: - AtomicFlag
+
+@Suite("Atomic flag")
+struct AtomicFlagTests {
+
+    @Test("starts false and reports what was stored")
+    func storesAndReads() {
+        let flag = AtomicFlag()
+        #expect(flag.value == false)
+        flag.value = true
+        #expect(flag.value == true)
+        flag.value = false
+        #expect(flag.value == false)
+    }
+
+    @Test("can start set, which is what a channel that has already heard audio needs")
+    func initialValue() {
+        #expect(AtomicFlag(true).value == true)
+    }
+}
+
+// MARK: - Mono output
+
+@Suite("Mixer summation")
+struct MonoDestinationTests {
+
+    @Test("a mono destination takes the left channel instead of doubling it")
+    func monoStrideOne() {
+        // Two interleaved stereo frames, one-buffer mono destination: the right
+        // channel has nowhere to go, so only the left samples are added and the
+        // tail of the destination is left untouched.
+        let source: [Float] = [1, 0.25, 0.5, 0.125]
+        var destination: [Float] = [10, 20, 30, 40]
+        source.withUnsafeBufferPointer { input in
+            destination.withUnsafeMutableBufferPointer { out in
+                accumulateInterleaved(input.baseAddress!, count: input.count,
+                                      into: out.baseAddress!, limit: out.count, stride: 1)
+            }
+        }
+        #expect(destination == [11, 20.5, 30, 40])
+    }
+
+    @Test("stereo stride is unchanged")
+    func stereoStrideTwo() {
+        let source: [Float] = [1, 2, 3, 4]
+        var destination: [Float] = [0, 0, 0, 0]
+        source.withUnsafeBufferPointer { input in
+            destination.withUnsafeMutableBufferPointer { out in
+                accumulateInterleaved(input.baseAddress!, count: input.count,
+                                      into: out.baseAddress!, limit: out.count)
+            }
+        }
+        #expect(destination == [1, 2, 3, 4])
+    }
+
+    @Test("source longer than the destination is truncated, not overflowed")
+    func truncatesToDestination() {
+        let source: [Float] = [1, 1, 1, 1, 1, 1]
+        var destination: [Float] = [0, 0]
+        source.withUnsafeBufferPointer { input in
+            destination.withUnsafeMutableBufferPointer { out in
+                accumulateInterleaved(input.baseAddress!, count: input.count,
+                                      into: out.baseAddress!, limit: out.count)
+            }
+        }
+        #expect(destination == [1, 1])
+    }
+}
+
+// MARK: - Format support
+
+@Suite("Format support")
+struct FormatSupportTests {
+
+    private func linearPCM(flags: UInt32,
+                           bits: UInt32,
+                           channels: UInt32) -> AudioStreamBasicDescription {
+        AudioStreamBasicDescription(mSampleRate: 48_000,
+                                    mFormatID: kAudioFormatLinearPCM,
+                                    mFormatFlags: flags,
+                                    mBytesPerPacket: 0,
+                                    mFramesPerPacket: 0,
+                                    mBytesPerFrame: 0,
+                                    mChannelsPerFrame: channels,
+                                    mBitsPerChannel: bits,
+                                    mReserved: 0)
+    }
+
+    private let float32 = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked
+
+    @Test("packed float32 stereo, as taps and most outputs deliver, is supported")
+    func acceptsFloat32Stereo() {
+        #expect(isSupportedMixFormat(linearPCM(flags: float32, bits: 32, channels: 2)))
+        #expect(isSupportedMixFormat(linearPCM(flags: float32, bits: 32, channels: 1)))
+    }
+
+    @Test("integer and wider formats are refused rather than mixed as noise")
+    func refusesIntegerAndWide() {
+        let int16 = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked
+        #expect(!isSupportedMixFormat(linearPCM(flags: int16, bits: 16, channels: 2)))
+        #expect(!isSupportedMixFormat(linearPCM(flags: float32, bits: 64, channels: 2)))
+    }
+
+    @Test("packed float is what real devices report, and it is what we require")
+    func packedIsRequiredNotForbidden() {
+        // 32-bit float with kAudioFormatFlagIsPacked is what Core Audio hands
+        // out; requiring the flag's *absence* would reject every real format.
+        #expect(isSupportedMixFormat(linearPCM(flags: float32, bits: 32, channels: 2)))
+        #expect(!isSupportedMixFormat(linearPCM(flags: kAudioFormatFlagIsFloat, bits: 32, channels: 2)))
+        var aac = linearPCM(flags: float32, bits: 32, channels: 2)
+        aac.mFormatID = kAudioFormatMPEG4AAC
+        #expect(!isSupportedMixFormat(aac))
+    }
+
+    @Test("surround layouts are refused: the mixer sums two channels, not six")
+    func refusesSurround() {
+        #expect(!isSupportedMixFormat(linearPCM(flags: float32, bits: 32, channels: 6)))
     }
 }
