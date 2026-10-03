@@ -80,6 +80,13 @@ default output ◀── tap-only aggregate device ◀── one mixer IOProc �
   command-line process: for `afplay` both `localizedName` and `executableURL` are
   nil, which would otherwise leave it named "Process 95736" and keyed by a PID that
   is dead on the next launch. Only the last-resort PID key is refused on save.
+- **One row per app, one tap per process.** A tap reads one process object and mutes
+  only that process, so an app running several processes needs a tap each — two
+  `afplay` instances, a browser plus its audio helpers. Leaving one untapped would
+  mean it kept playing at full volume while its sibling was muted, and the slider
+  would only control half the app. So channels are keyed per process, the UI groups
+  them into a single row per app (with a `×N` badge), and gain, mute and metering
+  apply across every process in the group.
 - **Tap** (`Audio/TapGainEngine.swift`) — one `CATapDescription(
   stereoMixdownOfProcesses:)` per app, plus one private aggregate device that is
   *only* the taps. The physical output device is never a subdevice: putting a tap
@@ -105,7 +112,16 @@ default output ◀── tap-only aggregate device ◀── one mixer IOProc �
 - **Recovery** — the watchdog runs on its own queue, not on the control queue, so it
   can still release taps if a HAL call is stuck. Engine state shared between the
   control queue, the watchdog and the UI is guarded by a recursive lock that the
-  audio thread never touches.
+  audio thread never touches. A freshly started mixer is given a grace period before
+  the watchdog can call it stalled, because waking a dock takes longer than the
+  watchdog interval and a mixer that has not produced its first cycle yet is not a
+  stalled one.
+- **Grace before releasing a tap** — switching the output device makes every app's
+  stream migrate, and for about a tenth of a second the app reports no output at
+  all. Releasing a tap on that flicker would let the audio through unprocessed and
+  then re-tap it with a pop, so a tap is held for a second first. An app that really
+  has stopped is silent anyway, and one that resumes inside the window is still
+  correctly tapped with nothing to undo.
 
 ## Tests
 
@@ -127,13 +143,20 @@ permission:
 Verified by running against real hardware:
 
 - process discovery, including apps that start after launch
+- seven concurrent audio processes, each getting its own tap and aggregate device
 - tap and aggregate-device creation and teardown, repeatedly
 - lazy mixer start, and mixer teardown when the last app goes quiet
-- silence-based permission-denial detection and tap release
+- one app stopping while another keeps playing: the tap is released without
+  disturbing the mixer
+- switching the default output device in both directions: the mixer is rebuilt
+  once per switch and the taps survive
+- twelve rapid start/stop cycles with balanced attach and detach, no errors
+- silence-based permission-denial detection and tap release, including releasing
+  every tap at once
 - the real tap format passing validation
 - the permission prompt appearing once and not again
 - a command-line player attaching under `path-/usr/bin/afplay`
-- 40 unit tests
+- 43 unit tests
 
 Not yet verified end to end, and it needs a signed build to check:
 
@@ -146,8 +169,8 @@ Not yet verified end to end, and it needs a signed build to check:
 
 Known limitations:
 
-- two instances of the same command-line binary share one level, since identity is
-  the executable path
+- several instances of one binary share a single row and level, which is what a
+  per-app mixer should do, but it does mean one instance cannot be singled out
 - device channels that are not float32 are rejected rather than converted
 - per-app volume does not affect an app's own offline rendering or DRM output
 

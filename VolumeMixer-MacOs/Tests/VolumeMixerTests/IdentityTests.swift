@@ -1,3 +1,4 @@
+import CoreAudio
 import Foundation
 import Testing
 
@@ -78,5 +79,46 @@ struct SettingsTests {
         let settings = Settings()
         #expect(settings.level(for: "com.example.absent").gain == 1)
         #expect(!settings.level(for: "com.example.absent").muted)
+    }
+}
+// MARK: - Grouping
+
+@Suite("Row grouping")
+struct GroupingTests {
+
+    private func app(bundleID: String, executablePath: String = "", pid: pid_t) -> AudioApp {
+        AudioApp(bundleID: bundleID,
+                 executablePath: executablePath,
+                 processObjectID: AudioObjectID(pid),
+                 pid: pid,
+                 displayName: "Test",
+                 icon: nil)
+    }
+
+    @Test("two instances of one app become one row, not two identical rows")
+    func collapsesInstances() {
+        let first = app(bundleID: "", executablePath: "/usr/bin/afplay", pid: 100)
+        let second = app(bundleID: "", executablePath: "/usr/bin/afplay", pid: 200)
+        let other = app(bundleID: "com.apple.Safari", pid: 300)
+
+        let groups = AppModel.groupByApp([first, other, second])
+        #expect(groups.count == 2)
+        #expect(groups[0].identity == "path-/usr/bin/afplay")
+        #expect(groups[0].processes.count == 2)
+        #expect(groups[1].identity == "com.apple.Safari")
+    }
+
+    @Test("each process still has its own key, so each gets its own tap")
+    func processKeysAreDistinct() {
+        let first = app(bundleID: "", executablePath: "/usr/bin/afplay", pid: 100)
+        let second = app(bundleID: "", executablePath: "/usr/bin/afplay", pid: 200)
+        #expect(first.id == second.id)
+        #expect(first.processKey != second.processKey)
+    }
+
+    @Test("discovery order is preserved")
+    func keepsOrder() {
+        let apps = [app(bundleID: "b.app", pid: 1), app(bundleID: "a.app", pid: 2)]
+        #expect(AppModel.groupByApp(apps).map(\.identity) == ["b.app", "a.app"])
     }
 }

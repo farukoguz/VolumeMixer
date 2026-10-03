@@ -13,6 +13,8 @@ final class AppModel: ObservableObject {
 
     struct Channel: Identifiable, Equatable {
         let app: AudioApp
+        /// How many processes of this app are playing, all controlled together.
+        var processCount: Int
         var gain: Float
         var muted: Bool
         var peak: Float
@@ -47,7 +49,14 @@ final class AppModel: ObservableObject {
     private var audibleApps: [AudioApp] = []
     /// Apps we have asked the engine to control, so we do not churn taps when a
     /// row merely re-renders.
-    private var attachedIDs: Set<String> = []
+    /// Process keys the engine currently has a tap for. Distinct from the channel
+    /// identities: one app can hold several of these.
+    private var attachedProcessKeys: Set<String> = []
+
+    /// How long a tap is held after an app stops reporting audio.
+    private let detachGrace: TimeInterval = 1.0
+    /// Process keys that have gone quiet, and when. Not yet detached.
+    private var pendingDetach: [String: Date] = [:]
 
     // MARK: - Init
 
@@ -130,22 +139,38 @@ final class AppModel: ObservableObject {
         syncEngineAttachments(for: apps)
     }
 
+    /// One row per app, however many processes it is running.
+    ///
+    /// Grouping matters for more than tidiness: two rows with the same identity
+    /// would be two `Identifiable` values with the same ID in the `ForEach`, and
+    /// a user dragging one of them while the other jumps would be inexplicable.
+    /// Collapses an app's processes into one row each, preserving discovery order.
+    nonisolated static func groupByApp(_ apps: [AudioApp]) -> [(identity: String, processes: [AudioApp])] {
+        var order: [String] = []
+        var members: [String: [AudioApp]] = [:]
+        for app in apps {
+            if members[app.id] == nil { order.append(app.id) }
+            members[app.id, default: []].append(app)
+        }
+        return order.compactMap { identity in
+            members[identity].map { (identity, $0) }
+        }
+    }
+
     private func syncChannels(for apps: [AudioApp]) {
-        let liveIDs = Set(engine.liveAppIDs)
+        let liveIDs = engine.liveAppIDs
         var next: [Channel] = []
         next.reserveCapacity(apps.count)
 
-        for app in apps {
-            let id = app.id
+        for (id, processes) in Self.groupByApp(apps) {
+            guard let app = processes.first else { continue }
             let saved = settings.level(for: id)
-            // A level is only shown as user-set if it was actually persisted;
-            // otherwise the app is at unity.
-            let gain = saved.gain
-            let muted = saved.muted
+            // An in-session change wins over the stored level.
             let existing = channels.first { $0.id == id }
             next.append(Channel(app: app,
-                                gain: existing?.gain ?? gain,
-                                muted: existing?.muted ?? muted,
+                                processCount: processes.count,
+                                gain: existing?.gain ?? saved.gain,
+                                muted: existing?.muted ?? saved.muted,
                                 peak: existing?.peak ?? 0,
                                 live: liveIDs.contains(id)))
         }
@@ -158,24 +183,59 @@ final class AppModel: ObservableObject {
     private func syncEngineAttachments(for apps: [AudioApp]) {
         var desired: [String: AudioApp] = [:]
         for app in apps {
-            desired[app.id] = app
+            desired[app.processKey] = app
         }
 
-        for id in attachedIDs where desired[id] == nil {
-            engine.detach(appID: id)
+        // Switching the output device makes every app's stream migrate, and for
+        // roughly a tenth of a second the app reports no output at all. Tapping
+        // is what mutes an app, so releasing on that flicker lets its audio
+        // through unprocessed for a moment and then re-taps it with a pop -- and
+        // it cost two extra tap and aggregate devices per switch. Holding the tap
+        // briefly costs nothing instead: an app that really has stopped is silent
+        // anyway, and one that resumes inside the window is still correctly
+        // tapped, with nothing to undo.
+        let now = Date()
+        for key in attachedProcessKeys where desired[key] == nil && pendingDetach[key] == nil {
+            pendingDetach[key] = now
         }
-        for (id, app) in desired where !attachedIDs.contains(id) {
+        for key in desired.keys {
+            // Came back inside the grace window: nothing was released.
+            pendingDetach.removeValue(forKey: key)
+        }
+
+        for (key, app) in desired where !attachedProcessKeys.contains(key) {
             engine.attach(to: app)
             // Re-apply a stored level so it takes effect as soon as the tap is
             // live rather than waiting for the user to touch the slider.
-            let saved = settings.level(for: id)
+            let saved = settings.level(for: app.id)
             if saved.muted {
-                engine.setMuted(true, for: id)
+                engine.setMuted(true, for: app.id)
             } else if abs(saved.gain - 1) > 0.001 {
-                engine.setGain(saved.gain, for: id)
+                engine.setGain(saved.gain, for: app.id)
             }
         }
-        attachedIDs = Set(desired.keys)
+        attachedProcessKeys.formUnion(desired.keys)
+        detachExpiredProcesses()
+    }
+
+    /// Releases taps whose app has stayed quiet for longer than the grace period.
+    ///
+    /// Driven by the meter timer rather than by discovery, because an app that
+    /// stops and never starts again produces no further discovery event: keyed off
+    /// events, its tap would be held for the rest of the session.
+    private func detachExpiredProcesses() {
+        guard !pendingDetach.isEmpty else { return }
+        let now = Date()
+        let expired = pendingDetach
+            .filter { _, since in now.timeIntervalSince(since) >= detachGrace }
+            .map(\.key)
+        for key in expired {
+            // Detach by process, not by app: one instance of an app exiting must
+            // not release the tap of the instance still playing.
+            engine.detach(processKey: key)
+            attachedProcessKeys.remove(key)
+            pendingDetach.removeValue(forKey: key)
+        }
     }
 
     // MARK: - Meters
@@ -186,8 +246,11 @@ final class AppModel: ObservableObject {
         if engine.availability != engineStatus {
             engineStatus = engine.availability
         }
+        // Before the empty-channels guard: a model with nothing audible can still
+        // be holding a tap through its grace period.
+        detachExpiredProcesses()
         guard !channels.isEmpty else { return }
-        let liveIDs = Set(engine.liveAppIDs)
+        let liveIDs = engine.liveAppIDs
         var changed = false
         var updated = channels
         for index in updated.indices {
@@ -262,8 +325,8 @@ final class AppModel: ObservableObject {
         // Detach then re-attach everything currently audible. Both hops land on
         // the engine's serial control queue in order, so the taps are rebuilt
         // after the old ones are gone.
-        for channel in channels { engine.detach(appID: channel.id) }
-        attachedIDs = []
+        for key in attachedProcessKeys { engine.detach(processKey: key) }
+        attachedProcessKeys = []
         syncEngineAttachments(for: audibleApps)
     }
 

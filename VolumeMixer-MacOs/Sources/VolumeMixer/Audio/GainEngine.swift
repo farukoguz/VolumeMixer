@@ -32,21 +32,35 @@ enum GainEngineAvailability: Equatable {
 /// audio graph being present. Discovery and the UI work whether or not the
 /// engine can actually process audio, which keeps the app useful (and
 /// debuggable) while permission is still missing.
+/// ## Processes versus apps
+///
+/// An app can be more than one process: two `afplay` instances, a browser and its
+/// audio helpers, anything with an XPC service. Each process needs its own tap,
+/// because a tap reads one process object and mutes only that process. If a second
+/// process were left untapped it would keep playing at full volume while its
+/// sibling was muted, and the slider would control only half the app.
+///
+/// So the engine taps per *process* (`attach`/`detach`, keyed by process) and
+/// controls per *app* (`setGain`, `setMuted`, `peak`, keyed by app identity). One
+/// slider, every process of that app.
 protocol GainEngine: AnyObject {
 
     var availability: GainEngineAvailability { get }
 
-    /// Begins controlling an app. Safe to call repeatedly for the same app.
+    /// Begins controlling one process of an app. Safe to call repeatedly for the
+    /// same process.
     func attach(to app: AudioApp)
 
-    /// Stops controlling an app and releases its tap, aggregate device and IOProc.
-    /// Releasing the tap is what unmutes the app again.
-    func detach(appID: String)
+    /// Stops controlling one process and releases its tap, aggregate device and
+    /// IOProc. Releasing the tap is what unmutes that process again.
+    func detach(processKey: String)
 
+    /// Applies to every process of the app at once.
     func setGain(_ gain: Float, for appID: String)
     func setMuted(_ muted: Bool, for appID: String)
 
-    /// Latest output peak for an app, 0...1. Read from the UI, never on the audio thread.
+    /// Loudest output peak across an app's processes, 0...1. Read from the UI,
+    /// never on the audio thread.
     func peak(for appID: String) -> Float
 
     /// Apps the engine is actually routing. Anything else falls through to the
@@ -73,9 +87,9 @@ final class UnavailableGainEngine: GainEngine {
 
     func attach(to app: AudioApp) {}
 
-    func detach(appID: String) {
-        levels.removeValue(forKey: appID)
-        muted.remove(appID)
+    func detach(processKey: String) {
+        // Levels are per app, so nothing is forgotten when one process of an app
+        // goes away while another keeps playing.
     }
 
     func setGain(_ gain: Float, for appID: String) {

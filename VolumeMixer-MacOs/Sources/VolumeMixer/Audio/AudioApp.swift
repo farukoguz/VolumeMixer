@@ -26,11 +26,23 @@ struct AudioApp: Identifiable, Equatable {
     var id: String {
         if !bundleID.isEmpty { return bundleID }
         if !executablePath.isEmpty { return "path-\(executablePath)" }
-        return "pid-\(pid)"
+        return Self.volatileIDPrefix + "\(pid)"
     }
 
+    /// Marks the one identity that is not worth persisting, because it dies with
+    /// the process. Shared with `Settings`, which only ever holds the string.
+    static let volatileIDPrefix = "pid-"
+
     /// Whether this identity is worth persisting across launches.
-    var hasStableIdentity: Bool { id.hasPrefix("pid-") == false }
+    var hasStableIdentity: Bool { !id.hasPrefix(Self.volatileIDPrefix) }
+
+    /// Uniquely identifies *this process*, unlike `id` which identifies the app.
+    ///
+    /// Needed because a tap reads one process object and mutes only that process.
+    /// Keying channels by `id` alone would leave a second instance of the same app
+    /// untapped: playing at full volume, unaffected by the slider, while its
+    /// sibling was muted.
+    var processKey: String { "\(id)#\(pid)" }
 
     /// Reads the full descriptor for a process object. Returns nil if the object
     /// has already gone away, which happens routinely -- apps exit between the

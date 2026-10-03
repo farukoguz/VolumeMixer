@@ -49,6 +49,15 @@ struct AppRowView: View {
                         .lineLimit(1)
                         .truncationMode(.middle)
 
+                    if channel.processCount > 1 {
+                        // One row, one slider, every process of the app: say so,
+                        // or moving the slider appears to change only some of it.
+                        Text("×\(channel.processCount)")
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .help("\(channel.processCount) processes, all controlled together")
+                    }
+
                     if !channel.live {
                         // The tap has not come up for this app. Levels are stored
                         // but not being applied yet.
