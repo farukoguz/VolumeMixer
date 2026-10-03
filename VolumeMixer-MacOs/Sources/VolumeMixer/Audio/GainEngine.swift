@@ -6,7 +6,8 @@ import Foundation
 /// produce silence, so it has to be detected by inspecting samples.
 enum GainEngineAvailability: Equatable {
     case ready
-    case permissionRequired
+    /// macOS refused system audio capture. Reported by inspecting samples, since
+    /// TCC denial is indistinguishable from success at every API call site.
     case permissionDenied
     case unsupportedOS
     case failed(String)
@@ -17,7 +18,7 @@ enum GainEngineAvailability: Equatable {
         switch self {
         case .ready:
             return "Per-app volume is active."
-        case .permissionRequired, .permissionDenied:
+        case .permissionDenied:
             return "Per-app volume needs the “System Audio Recording” permission."
         case .unsupportedOS:
             return "Per-app volume requires macOS 14.2 or later."

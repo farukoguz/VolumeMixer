@@ -184,19 +184,29 @@ struct MixerView: View {
     }
 
     private var permissionBanner: some View {
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: "lock.shield")
-                .font(.system(size: 12))
-                .foregroundStyle(.orange)
-            VStack(alignment: .leading, spacing: 3) {
-                Text("Per-app volume is waiting for permission")
-                    .font(.system(size: 11, weight: .semibold))
-                Text("macOS gates system-audio capture behind the “System Audio Recording” permission, and it refuses silently. Apps below are detected correctly but their levels are not applied yet.")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "lock.shield")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(model.engineStatus.summary)
+                        .font(.system(size: 11, weight: .semibold))
+                    Text("macOS gates system audio capture behind the “System Audio Recording” permission and refuses silently when it is missing, so no taps are kept open. Apps below are still detected correctly and their levels are remembered.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 0)
             }
-            Spacer(minLength: 0)
+
+            HStack(spacing: 8) {
+                Button("Open System Settings") { model.openPrivacySettings() }
+                Button("Retry") { model.retryGainControl() }
+            }
+            .controlSize(.small)
+            .font(.system(size: 11))
+            .padding(.leading, 20)
         }
         .padding(.horizontal, 12)
         .padding(.bottom, 10)

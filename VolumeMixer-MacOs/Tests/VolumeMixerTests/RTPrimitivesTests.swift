@@ -201,6 +201,145 @@ struct SampleRingBufferTests {
     }
 }
 
+// MARK: - Gain
+
+@Suite("Gain")
+struct GainTests {
+
+    private func scale(_ samples: [Float], by gain: Float) -> (output: [Float], peak: Float) {
+        var buffer = samples
+        let count = buffer.count
+        let peak = buffer.withUnsafeMutableBufferPointer {
+            scaleInPlace($0.baseAddress!, count: count, gain: gain)
+        }
+        return (buffer, peak)
+    }
+
+    @Test("unity gain leaves samples untouched")
+    func unityIsIdentity() {
+        let result = scale([-0.5, 0.25, 1, -1], by: 1)
+        #expect(result.output == [-0.5, 0.25, 1, -1])
+        #expect(abs(result.peak - 1) <= 1e-6)
+    }
+
+    @Test("zero gain silences and meters to zero")
+    func zeroGain() {
+        let result = scale([-0.5, 0.25, 1, -1], by: 0)
+        #expect(result.output == [0, 0, 0, 0])
+        #expect(result.peak == 0)
+    }
+
+    @Test("scales linearly and reports the post-gain peak")
+    func scalesAndMeters() {
+        let result = scale([-0.8, 0.4, 0.2], by: 0.5)
+        #expect(result.output.count == 3)
+        for (scaled, original) in zip(result.output, [Float(-0.8), 0.4, 0.2]) {
+            #expect(abs(scaled - original * 0.5) <= 1e-6)
+        }
+        // The meter reflects what the user set, not the tap level, so the peak is
+        // scaled too rather than the pre-gain 0.8.
+        #expect(abs(result.peak - 0.4) <= 1e-6)
+    }
+
+    @Test("peak is the largest absolute sample")
+    func peakIsMaxMagnitude() {
+        #expect(abs(scale([0.1, -0.9, 0.3], by: 1).peak - 0.9) <= 1e-6)
+        #expect(scale([0.1, -0.9, 0.3], by: 0.1).peak <= 0.1)
+    }
+
+    @Test("an empty buffer does nothing")
+    func emptyBuffer() {
+        #expect(scale([], by: 0.5).peak == 0)
+    }
+
+    @Test("gain above unity is allowed, since boosting is a legitimate ask")
+    func gainAboveUnity() {
+        let result = scale([0.25, -0.25], by: 4)
+        #expect(result.output == [1, -1])
+        #expect(abs(result.peak - 1) <= 1e-6)
+    }
+}
+
+// MARK: - Summation
+
+@Suite("Mixer summation")
+struct SummationTests {
+
+    @Test("interleaved channels add into the destination buffer")
+    func interleavedSum() {
+        var destination = [Float](repeating: 0, count: 8)
+        let source: [Float] = [1, 2, 3, 4, 5, 6, 7, 8]
+        destination.withUnsafeMutableBufferPointer { out in
+            source.withUnsafeBufferPointer { input in
+                accumulateInterleaved(input.baseAddress!, count: input.count,
+                                      into: out.baseAddress!, limit: out.count)
+            }
+        }
+        #expect(destination == [1, 2, 3, 4, 5, 6, 7, 8])
+    }
+
+    @Test("two tapped channels are scaled and summed, not replaced")
+    func scaledChannelsSum() {
+        // Mirrors what the mixer does per channel: drain the ring, scale the
+        // samples, then add them into the device buffer.
+        let loud = SampleRingBuffer(capacity: 8)
+        let quiet = SampleRingBuffer(capacity: 8)
+        let frames = 2
+        let unit: [Float] = [1, 1, 1, 1]
+        unit.withUnsafeBufferPointer { loud.write($0.baseAddress!, frameCount: frames) }
+        unit.withUnsafeBufferPointer { quiet.write($0.baseAddress!, frameCount: frames) }
+
+        var destination = [Float](repeating: 0, count: frames * 2)
+        var scratch = [Float](repeating: 0, count: frames * 2)
+
+        destination.withUnsafeMutableBufferPointer { out in
+            scratch.withUnsafeMutableBufferPointer { buffer in
+                for (ring, gain) in [(loud, Float(1)), (quiet, Float(0.5))] {
+                    let read = ring.read(into: buffer.baseAddress!, frameCount: frames)
+                    #expect(read == frames)
+                    scaleInPlace(buffer.baseAddress!, count: read * 2, gain: gain)
+                    accumulateInterleaved(buffer.baseAddress!, count: read * 2,
+                                          into: out.baseAddress!, limit: out.count)
+                }
+            }
+        }
+
+        #expect(destination == [1.5, 1.5, 1.5, 1.5])
+    }
+
+    @Test("interleaved accumulation respects the destination limit")
+    func interleavedRespectsLimit() {
+        var destination = [Float](repeating: 0, count: 2)
+        let source: [Float] = [1, 2, 3, 4]
+        destination.withUnsafeMutableBufferPointer { out in
+            source.withUnsafeBufferPointer { input in
+                // A device asking for more frames than were mixed must not write
+                // past the end of its buffer.
+                accumulateInterleaved(input.baseAddress!, count: input.count,
+                                      into: out.baseAddress!, limit: out.count)
+            }
+        }
+        #expect(destination == [1, 2])
+    }
+
+    @Test("planar accumulation splits interleaved frames across channels")
+    func planarSplit() {
+        let source: [Float] = [1, 10, 2, 20, 3, 30]
+        var left = [Float](repeating: 0, count: 3)
+        var right = [Float](repeating: 0, count: 3)
+        source.withUnsafeBufferPointer { input in
+            left.withUnsafeMutableBufferPointer { l in
+                right.withUnsafeMutableBufferPointer { r in
+                    accumulatePlanar(input.baseAddress!, frames: 3,
+                                     left: l.baseAddress!, right: r.baseAddress!)
+                }
+            }
+        }
+        #expect(left == [1, 2, 3])
+        #expect(right == [10, 20, 30])
+    }
+}
+
 // MARK: - Slots and counters
 
 @Suite("RT-safe slots")

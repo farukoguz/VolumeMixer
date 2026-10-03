@@ -78,6 +78,13 @@ final class AppModel: ObservableObject {
     // MARK: - Lifecycle
 
     func start() {
+        // Ask macOS about audio capture before anything is listening, so the
+        // permission prompt has a chance to appear at launch.
+        if let tapEngine = engine as? TapGainEngine {
+            let preflight = tapEngine.preflight()
+            if case .failed = preflight { engineStatus = preflight }
+        }
+
         discovery.start()
         deviceMonitor.start()
         refreshDevices()
@@ -224,6 +231,31 @@ final class AppModel: ObservableObject {
         persist()
     }
 
+    /// Re-attempts per-app gain after the user has granted Screen & System Audio
+    /// Recording. Taps are torn down and rebuilt from scratch, because a tap that
+    /// was created while capture was denied cannot start delivering samples
+    /// afterwards.
+    func retryGainControl() {
+        guard let tapEngine = engine as? TapGainEngine else { return }
+        tapEngine.resetAfterDenial()
+        engineStatus = .ready
+
+        // Detach then re-attach everything currently audible. Both hops land on
+        // the engine's serial control queue in order, so the taps are rebuilt
+        // after the old ones are gone.
+        for channel in channels { engine.detach(appID: channel.id) }
+        attachedIDs = []
+        syncEngineAttachments(for: audibleApps)
+    }
+
+    /// Opens the exact System Settings pane that governs audio capture, so the
+    /// permission prompt (which macOS only shows on demand, if at all) does not
+    /// have to be hunted for.
+    func openPrivacySettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
     func quit() {
         stop()
         NSApplication.shared.terminate(nil)
@@ -273,12 +305,9 @@ final class AppModel: ObservableObject {
 
     // MARK: - Derived
 
-    /// Per-app gain needs system-audio-capture permission. Until that is
-    /// granted the rows still list and track, but the sliders have nothing to
-    /// act on, so the UI says so rather than pretending.
-    var gainControlAvailable: Bool {
-        if case .permissionRequired = engineStatus { return false }
-        if case .permissionDenied = engineStatus { return false }
-        return true
-    }
+    /// Per-app gain needs system-audio-capture permission, and the engine also
+    /// stands down if it stalls or the format is unsupported. In any of those
+    /// states the rows still list apps and remember levels, but the sliders have
+    /// nothing to act on, so the UI says so rather than pretending.
+    var gainControlAvailable: Bool { engineStatus == .ready }
 }

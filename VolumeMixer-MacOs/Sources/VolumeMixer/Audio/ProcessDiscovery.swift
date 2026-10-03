@@ -173,7 +173,10 @@ final class ProcessDiscovery {
 
         for object in HAL.allProcessObjects() {
             guard HAL.isRunningOutput(object) else { continue }
-            guard let pid = HAL.pid(of: object), pid > 0, isAlive(pid) else { continue }
+            guard let pid = HAL.pid(of: object), pid > 0, pid != getpid() else { continue }
+            // Tapping our own process would feed the mixer back into itself:
+            // the reinjected audio would be tapped, scaled and reinjected again.
+            guard isAlive(pid) else { continue }
 
             if let cached = descriptorCache[pid], cached.processObjectID == object {
                 result.append(cached)
@@ -203,7 +206,6 @@ final class ProcessDiscovery {
     /// entirely. Signal 0 asks the kernel directly, and `EPERM` means the
     /// process exists but belongs to another user.
     private func isAlive(_ pid: pid_t) -> Bool {
-        if pid == getpid() { return true }
         if kill(pid, 0) == 0 { return true }
         return errno == EPERM
     }

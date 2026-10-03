@@ -13,8 +13,14 @@ enum Log {
     private static let audioLogger = Logger(subsystem: "com.volumemixer.app", category: "audio")
     private static let lifecycleLogger = Logger(subsystem: "com.volumemixer.app", category: "lifecycle")
 
+    /// Set `VM_DEBUG_LOG=1` to also write to stdout. os_log is unavailable when
+    /// the app is launched from a bundle with no console attached, which makes
+    /// a hung audio path very hard to diagnose.
+    private static let echoesToStdout = ProcessInfo.processInfo.environment["VM_DEBUG_LOG"] == "1"
+
     private static func write(_ logger: Logger, _ message: String) {
         logger.log("\(message, privacy: .public)")
+        if echoesToStdout { print("[log] \(message)"); fflush(stdout) }
     }
 
     static func audio(_ message: String) { write(audioLogger, message) }
@@ -22,11 +28,13 @@ enum Log {
 
     static func error(_ message: String) {
         audioLogger.error("\(message, privacy: .public)")
+        if echoesToStdout { print("[error] \(message)"); fflush(stdout) }
     }
 
     #if DEBUG
     static func debug(_ message: String) {
         audioLogger.debug("\(message, privacy: .public)")
+        if echoesToStdout { print("[debug] \(message)"); fflush(stdout) }
     }
     #else
     static func debug(_ message: String) {}

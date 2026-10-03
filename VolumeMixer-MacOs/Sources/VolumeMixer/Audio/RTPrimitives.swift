@@ -272,6 +272,63 @@ final class SampleRingBuffer {
     }
 }
 
+// MARK: - Gain
+
+/// Scales `count` interleaved samples in place by `gain` and returns the peak
+/// absolute value of the result.
+///
+/// Pulled out of the mixer so the arithmetic the user actually hears can be
+/// tested without an audio device attached, and so the hot loop has one
+/// obvious definition of "what does gain mean".
+@inline(__always)
+func scaleInPlace(_ samples: UnsafeMutablePointer<Float>, count: Int, gain: Float) -> Float {
+    guard count > 0 else { return 0 }
+    var peak: Float = 0
+    var index = 0
+    while index < count {
+        let scaled = samples[index] * gain
+        samples[index] = scaled
+        let magnitude = abs(scaled)
+        if magnitude > peak { peak = magnitude }
+        index += 1
+    }
+    return peak
+}
+
+// MARK: - Summation
+
+/// Adds interleaved stereo frames from `source` into an interleaved destination.
+///
+/// `limit` is the destination's capacity in samples, which may be smaller than
+/// `count` if a device ever asks for more frames than were mixed.
+@inline(__always)
+func accumulateInterleaved(_ source: UnsafePointer<Float>,
+                           count: Int,
+                           into destination: UnsafeMutablePointer<Float>,
+                           limit: Int) {
+    var index = 0
+    let bound = min(count, limit)
+    while index < bound {
+        destination[index] += source[index]
+        index += 1
+    }
+}
+
+/// Adds interleaved stereo frames from `source` into a deinterleaved pair of
+/// destination buffers.
+@inline(__always)
+func accumulatePlanar(_ source: UnsafePointer<Float>,
+                     frames: Int,
+                     left: UnsafeMutablePointer<Float>,
+                     right: UnsafeMutablePointer<Float>) {
+    var frame = 0
+    while frame < frames {
+        left[frame] += source[frame * 2]
+        right[frame] += source[frame * 2 + 1]
+        frame += 1
+    }
+}
+
 // MARK: - ChannelTable
 
 /// A fixed-capacity, lock-free table of live audio channels that a real-time

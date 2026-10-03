@@ -186,6 +186,10 @@ final class TapGainEngine: GainEngine {
     private var _availability: GainEngineAvailability = .ready
 
     private let controlQueue = DispatchQueue(label: "com.volumemixer.engine")
+    /// The watchdog deliberately does not share the control queue: taps mute the
+    /// apps they read, so recovery must still be possible if a HAL call on that
+    /// queue is stuck.
+    private let watchdogQueue = DispatchQueue(label: "com.volumemixer.engine.watchdog")
     private let tapQueue = DispatchQueue(label: "com.volumemixer.tap.rt", qos: .userInteractive)
     private let mixerQueue = DispatchQueue(label: "com.volumemixer.mixer.rt", qos: .userInteractive)
 
@@ -215,10 +219,26 @@ final class TapGainEngine: GainEngine {
     private var watchdogTimer: DispatchSourceTimer?
     private let watchdogInterval: TimeInterval = 1.0
 
-    /// Gain/mute requested per app, applied once a channel exists. Kept here so
-    /// a level set before the tap came up is not lost.
-    private var pendingGain: [String: Float] = [:]
-    private var pendingMute: [String: Bool] = [:]
+    /// The level the user chose per app, held separately from mute so that
+    /// unmuting restores what was there before. Kept here rather than in the UI
+    /// because a level set before the tap exists still has to be applied.
+    private var levels: [String: Float] = [:]
+    private var muteFlags: [String: Bool] = [:]
+
+    /// Guards everything the control queue, the watchdog and the UI all touch:
+    /// the channel set, the mixer handles, and the stored levels.
+    ///
+    /// It is *not* on the audio path. The mixer reads the lock-free
+    /// `ChannelTable` and the per-channel slots, so it never waits on this. The
+    /// watchdog has to be able to take it even when the control queue is stuck
+    /// inside a HAL call, which is why the watchdog runs on its own queue rather
+    /// than as work on `controlQueue`.
+    private let stateLock = NSRecursiveLock()
+
+    /// The value the engine actually wants for an app right now.
+    private func effectiveGain(_ appID: String) -> Float {
+        (muteFlags[appID] ?? false) ? 0 : (levels[appID] ?? 1)
+    }
 
     init() {
         // The mixer is deliberately *not* started here. An IOProc on the user's
@@ -232,40 +252,44 @@ final class TapGainEngine: GainEngine {
     func attach(to app: AudioApp) {
         let appID = channelID(for: app)
         controlQueue.async { [weak self] in
-            guard let self, self.channels[appID] == nil else { return }
+            guard let self else { return }
+            self.stateLock.withLock {
+                guard self.channels[appID] == nil else { return }
 
-            let channel = TapChannel(appID: appID, processObjectID: app.processObjectID)
-            let status = channel.start(queue: self.tapQueue)
-            guard status == noErr else {
-                Log.error("tap start failed for \(appID): \(fourcc(status))")
-                return
-            }
-            if let gain = self.pendingGain[appID] {
-                channel.gain.value = gain
-                if self.pendingMute[appID] != true { channel.gain.value = gain }
-            }
-            if self.pendingMute[appID] == true { channel.gain.value = 0 }
+                let channel = TapChannel(appID: appID, processObjectID: app.processObjectID)
+                let status = channel.start(queue: self.tapQueue)
+                guard status == noErr else {
+                    Log.error("tap start failed for \(appID): \(fourcc(status))")
+                    return
+                }
+                channel.gain.value = self.effectiveGain(appID)
 
-            self.channels[appID] = channel
-            self.publishChannels()
-            self.startMixerIfNeeded()
-            Log.lifecycle("attached \(appID) tap=\(channel.tapID) agg=\(channel.aggregateID)")
+                self.channels[appID] = channel
+                self.publishChannels()
+                self.startMixerIfNeeded()
+                Log.lifecycle("attached \(appID) tap=\(channel.tapID) agg=\(channel.aggregateID)")
+            }
         }
     }
 
     func detach(appID: String) {
         controlQueue.async { [weak self] in
-            guard let self, let channel = self.channels.removeValue(forKey: appID) else { return }
-            // Unpublish before stopping so the mixer stops reading the channel,
-            // then hold the object alive briefly rather than immediately
-            // releasing it out from under an in-flight callback.
-            self.publishChannels()
-            channel.stop()
-            self.retire(channel)
-            // With the last channel gone there is nothing to mix, so release the
-            // device again.
-            if self.channels.isEmpty { self.stopMixer() }
-            Log.lifecycle("detached \(appID)")
+            guard let self else { return }
+            self.stateLock.withLock {
+                guard let channel = self.channels.removeValue(forKey: appID) else { return }
+                self.levels.removeValue(forKey: appID)
+                self.muteFlags.removeValue(forKey: appID)
+                // Unpublish before stopping so the mixer stops reading the
+                // channel, then hold the object alive briefly rather than
+                // immediately releasing it out from under an in-flight callback.
+                self.publishChannels()
+                channel.stop()
+                self.retire(channel)
+                // With the last channel gone there is nothing to mix, so release
+                // the device again.
+                if self.channels.isEmpty { self.stopMixer() }
+                Log.lifecycle("detached \(appID)")
+            }
         }
     }
 
@@ -284,49 +308,86 @@ final class TapGainEngine: GainEngine {
     func setGain(_ gain: Float, for appID: String) {
         controlQueue.async { [weak self] in
             guard let self else { return }
-            let clamped = max(0, gain)
-            self.pendingGain[appID] = clamped
-            self.pendingMute[appID] = false
-            self.channels[appID]?.gain.value = clamped
+            self.stateLock.withLock {
+                self.levels[appID] = max(0, gain)
+                // Moving the slider is an unmute, which is what every mixer does.
+                self.muteFlags[appID] = false
+                self.channels[appID]?.gain.value = self.effectiveGain(appID)
+            }
         }
     }
 
     func setMuted(_ muted: Bool, for appID: String) {
         controlQueue.async { [weak self] in
             guard let self else { return }
-            self.pendingMute[appID] = muted
-            let base = self.pendingGain[appID] ?? 1
-            self.pendingGain[appID] = muted ? 0 : base
-            self.channels[appID]?.gain.value = muted ? 0 : base
+            self.stateLock.withLock {
+                self.muteFlags[appID] = muted
+                // The stored level is left alone so unmuting restores it.
+                self.channels[appID]?.gain.value = self.effectiveGain(appID)
+            }
         }
     }
 
     func peak(for appID: String) -> Float {
-        channels[appID]?.peak.value ?? 0
+        // Read from the UI thread while the control queue may be mutating the
+        // dictionary, so this takes the state lock. The peak itself is a plain
+        // aligned read, so it costs nothing on the audio thread.
+        stateLock.withLock { channels[appID]?.peak.value ?? 0 }
     }
 
-    var liveAppIDs: Set<String> { Set(channels.keys) }
+    var liveAppIDs: Set<String> { stateLock.withLock { Set(channels.keys) } }
 
     func shutdown() {
         watchdogTimer?.cancel()
         watchdogTimer = nil
-        stopMixer()
         // Never call this from the control queue: `sync` onto a queue that is
         // already draining would deadlock.
         controlQueue.sync {
-            for channel in channels.values { channel.stop() }
-            channels.removeAll()
-            publishChannels()
-            retired.removeAll()
+            stateLock.withLock {
+                stopMixer()
+                for channel in channels.values { channel.stop() }
+                channels.removeAll()
+                publishChannels()
+                retired.removeAll()
+                mixScratch?.deinitialize(count: mixScratchCapacity)
+                mixScratch?.deallocate()
+                mixScratch = nil
+                mixScratchCapacity = 0
+            }
         }
-        mixScratch?.deinitialize(count: mixScratchCapacity)
-        mixScratch?.deallocate()
-        mixScratch = nil
-        mixScratchCapacity = 0
     }
 
     func channelID(for app: AudioApp) -> String {
         app.bundleID.isEmpty ? "pid-\(app.pid)" : app.bundleID
+    }
+
+    // MARK: - Preflight
+
+    /// Creates and immediately destroys a global tap at launch.
+    ///
+    /// It is never read, so it cannot affect audio, but creating it is what makes
+    /// macOS evaluate the audio-capture permission. Doing this at startup means
+    /// the user is asked while they are looking at the app, instead of the first
+    /// tap silently delivering zeros later with no explanation.
+    ///
+    /// A tap that creates cleanly is not proof that capture is permitted -- TCC
+    /// denial is reported as success -- so this only reports hard API failures.
+    /// Whether samples actually flow is decided by inspecting them.
+    func preflight() -> GainEngineAvailability {
+        let description = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
+        description.uuid = UUID()
+        description.name = "VolumeMixer-Preflight"
+        description.isPrivate = true
+
+        var tapID: AudioObjectID = kAudioObjectUnknown
+        let status = AudioHardwareCreateProcessTap(description, &tapID)
+        guard status == noErr, tapID != kAudioObjectUnknown else {
+            Log.error("preflight tap: \(fourcc(status))")
+            return .failed("audio capture unavailable (\(fourcc(status)))")
+        }
+        _ = AudioHardwareDestroyProcessTap(tapID)
+        Log.lifecycle("preflight tap created and released")
+        return .ready
     }
 
     // MARK: - Channel publication
@@ -385,6 +446,9 @@ final class TapGainEngine: GainEngine {
             return
         }
         lastMixerCycle = mixerCycles.value
+        // A previous failure (an unsupported device, say) should not stick once
+        // the device has been replaced with something that works.
+        availability = .ready
         Log.lifecycle("mixer started device=\(device) rate=\(outputFormat.mSampleRate) ch=\(outputFormat.mChannelsPerFrame)")
     }
 
@@ -395,11 +459,13 @@ final class TapGainEngine: GainEngine {
     }
 
     private func stopMixer() {
+        let wasRunning = mixerProcID != nil
         if let proc = mixerProcID {
             _ = AudioDeviceStop(outputDevice, proc)
             _ = AudioDeviceDestroyIOProcID(outputDevice, proc)
             mixerProcID = nil
         }
+        if wasRunning { Log.lifecycle("mixer stopped") }
         outputDevice = kAudioObjectUnknown
         lastMixerCycle = mixerCycles.value
     }
@@ -466,32 +532,13 @@ final class TapGainEngine: GainEngine {
             let framesRead = channel.ring.read(into: scratch, frameCount: usableFrames)
             guard framesRead > 0 else { return }
 
-            let gain = channel.gain.value
-            var peak: Float = 0
-            var index = 0
-            while index < sampleCount {
-                let scaled = scratch[index] * gain
-                scratch[index] = scaled
-                let magnitude = abs(scaled)
-                if magnitude > peak { peak = magnitude }
-                index += 1
-            }
-            channel.peak.value = peak
+            channel.peak.value = scaleInPlace(scratch, count: sampleCount, gain: channel.gain.value)
 
             if interleaved {
-                let limit = min(sampleCount, destinationSamples)
-                var i = 0
-                while i < limit {
-                    destination[i] += scratch[i]
-                    i += 1
-                }
+                accumulateInterleaved(scratch, count: sampleCount,
+                                      into: destination, limit: destinationSamples)
             } else {
-                var frame = 0
-                while frame < framesRead {
-                    destination[frame] += scratch[frame * 2]
-                    right[frame] += scratch[frame * 2 + 1]
-                    frame += 1
-                }
+                accumulatePlanar(scratch, frames: framesRead, left: destination, right: right)
             }
         }
     }
@@ -503,12 +550,14 @@ final class TapGainEngine: GainEngine {
     /// have channels that are muted and therefore need the mixer to bring them
     /// back -- and in that case silence is the failure we must avoid.
     private func startWatchdog() {
-        let timer = DispatchSource.makeTimerSource(queue: controlQueue)
+        let timer = DispatchSource.makeTimerSource(queue: watchdogQueue)
         timer.schedule(deadline: .now() + watchdogInterval, repeating: watchdogInterval)
         timer.setEventHandler { [weak self] in
             guard let self else { return }
-            self.checkMixerHealth()
-            self.pruneRetired()
+            self.stateLock.withLock {
+                self.checkMixerHealth()
+                self.pruneRetired()
+            }
         }
         timer.resume()
         watchdogTimer = timer
@@ -525,14 +574,7 @@ final class TapGainEngine: GainEngine {
 
         // The mixer is running but not being serviced. Anything tapped right now
         // is muted with no replacement path, so release everything.
-        Log.error("mixer stalled: releasing \(self.channels.count) tap(s) to restore audio")
-        let released = Array(channels.values)
-        channels.removeAll()
-        publishChannels()
-        for channel in released { channel.stop() }
-        stopMixer()
-        // Nothing is reading the table any more, so the objects can go now.
-        retired.removeAll()
+        releaseAllTaps(reason: "mixer stalled")
         availability = .failed("mixer stalled; audio restored, gain disabled")
     }
 
@@ -555,20 +597,58 @@ final class TapGainEngine: GainEngine {
         silentTicks += 1
         // Five seconds of an "audible" app producing pure silence from a tap
         // that is demonstrably running is not a coincidence.
-        if silentTicks >= 5, availability == .ready {
-            availability = .permissionDenied
-            Log.error("taps deliver only silence: system audio capture is not permitted")
+        guard silentTicks >= 5, availability == .ready else { return }
+        availability = .permissionDenied
+        Log.error("taps deliver only silence: releasing taps, system audio capture is not permitted")
+
+        // A tap mutes its app while it is being read. Whatever CoreAudio decides
+        // a denied tap means, the only safe response is to stop tapping: if the
+        // mute engaged we have been silencing apps, and if it did not we were
+        // reinjecting nothing for no reason. Either way, releasing them restores
+        // ordinary system audio.
+        releaseAllTaps(reason: "permission denied")
+    }
+
+    /// Destroys every tap and stops the mixer. This is the single recovery path
+    /// for any state where the audio graph cannot be trusted.
+    private func releaseAllTaps(reason: String) {
+        let released = Array(channels.values)
+        channels.removeAll()
+        // Unpublish before destroying, so the mixer stops reading the channels
+        // before their taps go away.
+        publishChannels()
+        for channel in released {
+            channel.stop()
+            retire(channel)
+        }
+        stopMixer()
+        Log.lifecycle("released \(released.count) tap(s): \(reason)")
+    }
+
+    /// Clears a detected denial so the taps can be tried again, after the user
+    /// has granted permission in System Settings.
+    func resetAfterDenial() {
+        controlQueue.async { [weak self] in
+            guard let self else { return }
+            self.stateLock.withLock {
+                self.silentTicks = 0
+                self.availability = .ready
+                Log.lifecycle("retrying taps after a permission denial")
+            }
         }
     }
 
     /// Rebuilds the mixer after the default output device or its format changes.
     func handleDeviceChange() {
         controlQueue.async { [weak self] in
-            guard let self, self.mixerProcID != nil else { return }
-            // Taps keep their own clock, so they survive a device change; only
-            // the mixer has to be rebuilt around the new format.
-            self.stopMixer()
-            self.startMixer()
+            guard let self else { return }
+            self.stateLock.withLock {
+                guard self.mixerProcID != nil else { return }
+                // Taps keep their own clock, so they survive a device change;
+                // only the mixer has to be rebuilt around the new format.
+                self.stopMixer()
+                self.startMixer()
+            }
         }
     }
 }
