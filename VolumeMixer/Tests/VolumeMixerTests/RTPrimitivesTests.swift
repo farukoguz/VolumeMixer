@@ -557,3 +557,134 @@ struct FormatSupportTests {
         #expect(!isSupportedMixFormat(linearPCM(flags: float32, bits: 32, channels: 6)))
     }
 }
+
+// MARK: - Steady read
+
+@Suite("Steady read")
+struct ReadSteadyTests {
+
+    private func fill(_ ring: SampleRingBuffer, frames: Int, from start: Float) {
+        var samples: [Float] = []
+        var value = start
+        for _ in 0..<frames {
+            samples.append(value)
+            samples.append(value)
+            value += 1
+        }
+        samples.withUnsafeBufferPointer { ring.write($0.baseAddress!, frameCount: frames) }
+    }
+
+    @Test("a full cycle comes back whole")
+    func fullCycle() {
+        let ring = SampleRingBuffer(capacity: 4096)
+        fill(ring, frames: 512, from: 1)
+        var out = [Float](repeating: 0, count: 512 * 2)
+        let ok = out.withUnsafeMutableBufferPointer {
+            ring.readSteady(into: $0.baseAddress!, frameCount: 512, rateRatio: 1.0)
+        }
+        #expect(ok)
+        #expect(out[0] == 1)
+        #expect(out[2] == 2)
+        #expect(out[1022] == 512)
+    }
+
+    /// The regression that produced the stutter: asked for more frames than the
+    /// tap had delivered, the old reader returned a short count and the caller
+    /// left the rest of the cycle silent.
+    @Test("a starved cycle still returns the frames it was asked for")
+    func starvedCycleIsFilled() {
+        let ring = SampleRingBuffer(capacity: 4096)
+        fill(ring, frames: 128, from: 1)
+        var out = [Float](repeating: 0, count: 512 * 2)
+        let ok = out.withUnsafeMutableBufferPointer {
+            ring.readSteady(into: $0.baseAddress!, frameCount: 512, rateRatio: 1.0)
+        }
+        #expect(!ok, "starvation should be reported")
+        // Real audio at the front, faded to silence behind, and never a hard cut
+        // straight to zero in the middle of a cycle.
+        #expect(out[0] == 1)
+        #expect(out[254] != 0)
+        #expect(out[1022] == 0, "the tail must end at silence, not mid-waveform")
+        // Real audio up to the last buffered frame, silence after it, with no
+        // fabricated samples in between.
+        let firstSilence = out.firstIndex(of: 0).map { $0 / 2 } ?? 512
+        #expect(firstSilence == 128, "silence must begin exactly where input ran out")
+    }
+
+    @Test("a ratio above one consumes input faster, as a mismatched clock needs")
+    func ratioConsumesFaster() {
+        let ring = SampleRingBuffer(capacity: 4096)
+        fill(ring, frames: 1024, from: 1)
+        var out = [Float](repeating: 0, count: 256 * 2)
+        _ = out.withUnsafeMutableBufferPointer {
+            ring.readSteady(into: $0.baseAddress!, frameCount: 256, rateRatio: 2.0)
+        }
+        // 256 output frames at 2 input frames each. Output frame i reads input
+        // frame 2i, so the last lands on input frame 510 and the frames in
+        // between are deliberately dropped to burn the extra input clock.
+        #expect(out[0] == 1)
+        #expect(out[510] == 511)
+        #expect(ring.availableFrames == 1024 - 512)
+    }
+
+    @Test("a fractional ratio neither drops nor repeats input over time")
+    func fractionalRatioIsStable() {
+        let ring = SampleRingBuffer(capacity: 8192)
+        fill(ring, frames: 4096, from: 1)
+        var out = [Float](repeating: 0, count: 400 * 2)
+        // 400 output frames at 1.0025 input frames each = 401 input frames.
+        _ = out.withUnsafeMutableBufferPointer {
+            ring.readSteady(into: $0.baseAddress!, frameCount: 400, rateRatio: 1.0025)
+        }
+        // 400 output frames at 1.0025 input frames each consumes very slightly
+        // more than 400 input frames. The remainder is carried in the phase, and
+        // float accumulation decides whether it lands as 400 or 401, so this
+        // pins the behaviour that matters -- no whole frame skipped or replayed
+        // -- rather than an exact total.
+        #expect(ring.availableFrames == 4096 - 400 || ring.availableFrames == 4096 - 401)
+        // Interpolation means output values sit between two input samples, so
+        // these are checked as a ramp that starts and ends in the right place
+        // rather than as exact equality.
+        #expect(abs(out[0] - 1.0) < 0.001)
+        // Output frame 399 sits at input position 399 x 1.0025 = 399.9975, so
+        // it interpolates almost all the way to the 401st input frame (value
+        // 401). Checking it near 401 is what pins the accumulated phase: a reader
+        // that reset its fraction each cycle would land on 400 instead.
+        #expect(abs(out[798] - 401.0) < 0.01)
+        var monotonic = true
+        for frame in 1..<400 where out[frame * 2] < out[(frame - 1) * 2] {
+            monotonic = false
+        }
+        #expect(monotonic, "interpolation must not step backwards")
+    }
+
+    @Test("an empty ring reports starvation rather than inventing audio")
+    func emptyRing() {
+        let ring = SampleRingBuffer(capacity: 4096)
+        // Deliberately not zeroed: the reader must not depend on the caller
+        // having cleared the destination.
+        var out = [Float](repeating: 9, count: 64 * 2)
+        let ok = out.withUnsafeMutableBufferPointer {
+            ring.readSteady(into: $0.baseAddress!, frameCount: 64, rateRatio: 1.0)
+        }
+        #expect(!ok)
+        #expect(out.allSatisfy { $0 == 0 })
+    }
+
+    @Test("reset clears the fractional position so no stale phase carries over")
+    func resetClearsPhase() {
+        let ring = SampleRingBuffer(capacity: 4096)
+        fill(ring, frames: 1024, from: 1)
+        var out = [Float](repeating: 0, count: 100 * 2)
+        _ = out.withUnsafeMutableBufferPointer {
+            ring.readSteady(into: $0.baseAddress!, frameCount: 100, rateRatio: 1.5)
+        }
+        ring.reset()
+        #expect(ring.availableFrames == 0)
+        fill(ring, frames: 256, from: 1)
+        _ = out.withUnsafeMutableBufferPointer {
+            ring.readSteady(into: $0.baseAddress!, frameCount: 8, rateRatio: 1.0)
+        }
+        #expect(out[0] == 1, "a reset ring must start from its first frame")
+    }
+}

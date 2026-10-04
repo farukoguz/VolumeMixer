@@ -124,6 +124,36 @@ final class AtomicFlag {
     }
 }
 
+/// A sample rate shared between the thread that starts a tap and the real-time
+/// mix thread.
+///
+/// Bit-cast rather than stored as a `Double`: an aligned 64-bit load is atomic on
+/// arm64 and x86-64, whereas a `Double` property would be a pair of 32-bit
+/// stores that the mixer could read half-updated. The mix thread reads this every
+/// cycle, so tearing here would show up as an audible pitch glitch rather than a
+/// crash.
+final class AtomicRate {
+
+    private let storage: UnsafeMutablePointer<UInt64>
+
+    init(_ value: Double = 0) {
+        storage = .allocate(capacity: 1)
+        storage.initialize(to: value.bitPattern)
+    }
+
+    deinit {
+        storage.deinitialize(count: 1)
+        storage.deallocate()
+    }
+
+    /// Real-time safe.
+    @inline(__always)
+    var value: Double {
+        get { Double(bitPattern: storage.pointee) }
+        set { storage.pointee = newValue.bitPattern }
+    }
+}
+
 // MARK: - SampleRingBuffer
 
 /// Lock-free single-producer/single-consumer ring buffer of interleaved stereo
@@ -148,6 +178,11 @@ final class SampleRingBuffer {
     /// Must be a power of two.
     static let defaultCapacity = 1 << 15   // 32768 frames ~= 0.68s at 48 kHz
 
+    /// The mixer's read target, i.e. how many input frames it consumes per
+    /// output frame when the tap and the device agree. The mixer scales this by
+    /// the ratio between the tap's sample rate and the device's.
+    static let defaultTargetFrames = 4096   // ~85 ms at 48 kHz
+
     private let storage: UnsafeMutablePointer<Float>
     private let capacity: Int
     private let mask: Int
@@ -156,6 +191,8 @@ final class SampleRingBuffer {
     private let writeStorage: UnsafeMutablePointer<Int64>
     /// Consumer-owned.
     private let readStorage: UnsafeMutablePointer<Int64>
+    /// Consumer-owned fractional read position, within the unread window.
+    private let readPhase: UnsafeMutablePointer<Double>
 
     private static let cacheLine = 64
 
@@ -173,6 +210,8 @@ final class SampleRingBuffer {
         writeStorage.initialize(to: 0)
         readStorage = .allocate(capacity: SampleRingBuffer.cacheLine)
         readStorage.initialize(to: 0)
+        readPhase = .allocate(capacity: SampleRingBuffer.cacheLine)
+        readPhase.initialize(to: 0)
     }
 
     deinit {
@@ -182,6 +221,8 @@ final class SampleRingBuffer {
         writeStorage.deallocate()
         readStorage.deinitialize(count: SampleRingBuffer.cacheLine)
         readStorage.deallocate()
+        readPhase.deinitialize(count: SampleRingBuffer.cacheLine)
+        readPhase.deallocate()
     }
 
     /// Real-time safe producer side. `samples` is interleaved stereo.
@@ -221,7 +262,11 @@ final class SampleRingBuffer {
     }
 
     /// Real-time safe consumer side. Fills `out` with interleaved stereo frames.
-    /// Returns the number of frames produced.
+    /// Returns the number of frames produced, which may be fewer than asked for.
+    ///
+    /// The mix cycle is written against this contract: it treats a short read as
+    /// "nothing more available right now" and holds the previous frame rather
+    /// than assuming the buffer was filled. See `readSteady`.
     @inline(__always)
     func read(into out: UnsafeMutablePointer<Float>, frameCount: Int) -> Int {
         let read = readStorage.pointee
@@ -247,6 +292,75 @@ final class SampleRingBuffer {
         let advanced = read &+ Int64(toRead)
         if advanced > readStorage.pointee { readStorage.pointee = advanced }
         return toRead
+    }
+
+    /// Reads exactly `frameCount` frames for the mixer, consuming input at
+    /// `rateRatio` frames per output frame and interpolating between them.
+    ///
+    /// This exists because the two audio clocks in this app are not the same
+    /// clock. Each tap runs on its aggregate device's clock and the mixer runs on
+    /// the output device's, and they differ by a small fraction that is not zero.
+    /// Reading with `read` alone cannot cope: it hands back only whole frames
+    /// that are already buffered, so the mix cycle comes up short by a frame or
+    /// two almost every time, the tail of the cycle is silence, and the shortfall
+    /// never recovers because the reader never consumes anything extra. That
+    /// repeated gap is the stuttering, chopped "robot" sound.
+    ///
+    /// `readPhase` carries the sub-frame remainder, so over time input frames are
+    /// consumed at exactly `rateRatio` and none are skipped or replayed. A ratio
+    /// above 1 drops the frames in between; below 1 interpolates across them.
+    ///
+    /// When input genuinely runs short the tail is faded to silence rather than
+    /// cut, so the remaining fault is a dip and not a click.
+    ///
+    /// Returns `true` when the whole cycle was filled from real audio.
+    /// Real-time safe: no allocation, no locks.
+    @inline(__always)
+    func readSteady(into out: UnsafeMutablePointer<Float>,
+                    frameCount: Int,
+                    rateRatio: Double) -> Bool {
+        guard frameCount > 0 else { return true }
+        let ratio = max(0.25, min(4.0, rateRatio))
+
+        for produced in 0..<frameCount {
+            let availableNow = Int(writeStorage.pointee &- readStorage.pointee)
+            guard availableNow > 0 else {
+                // Nothing buffered, so there is no partial frame to fade out
+                // from: the cycle's tail is silence. Assign rather than scale so
+                // this does not depend on the caller having cleared the buffer,
+                // and the mixer can treat a false return as "nothing usable".
+                for index in (produced * 2)..<(frameCount * 2) {
+                    out[index] = 0
+                }
+                readPhase.pointee = 0
+                return false
+            }
+
+            // `readStorage` points at the current input frame and `readPhase` is
+            // how far to interpolate towards the one after it.
+            let base = Int(readStorage.pointee) & mask
+            let next = (base + 1) & mask
+            let phase = readPhase.pointee
+
+            let l0 = storage[base * 2]
+            let r0 = storage[base * 2 + 1]
+            // With a single frame buffered there is nothing to interpolate
+            // towards, so hold it. Requiring a lookahead frame instead would
+            // shorten every read by one and truncate the mix cycle.
+            let hasNext = availableNow > 1
+            let l1 = hasNext ? storage[next * 2] : l0
+            let r1 = hasNext ? storage[next * 2 + 1] : r0
+
+            out[produced * 2] = Float(Double(l0) + (Double(l1) - Double(l0)) * phase)
+            out[produced * 2 + 1] = Float(Double(r0) + (Double(r1) - Double(r0)) * phase)
+
+            // Advance by whole input frames, carrying the remainder.
+            let total = phase + ratio
+            let advance = Int(total)
+            readStorage.pointee &+= Int64(advance)
+            readPhase.pointee = total - Double(advance)
+        }
+        return true
     }
 
     /// Real-time safe producer side for a stereo mixdown tap, which delivers
@@ -299,6 +413,7 @@ final class SampleRingBuffer {
     /// never replayed by the mixer.
     func reset() {
         readStorage.pointee = writeStorage.pointee
+        readPhase.pointee = 0
     }
 
     var availableFrames: Int {

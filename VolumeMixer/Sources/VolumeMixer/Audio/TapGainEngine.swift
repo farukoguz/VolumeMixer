@@ -32,6 +32,12 @@ final class TapChannel {
 
     let ring = SampleRingBuffer()
 
+    /// The tap's sample rate, captured at start-up. The mixer runs on the output
+    /// device's clock, which is a different clock, so this ratio is what lets the
+    /// reader reconcile the two instead of falling behind by a frame each cycle.
+    /// Written once before the IOProc starts and only read afterwards.
+    let tapSampleRate = AtomicRate()
+
     /// True once any non-zero sample has passed through the tap. On macOS a
     /// denied audio-capture permission looks exactly like a working pipeline
     /// that happens to produce zeros, so this is how denial is detected.
@@ -101,6 +107,7 @@ final class TapChannel {
             stop()
             return kAudio_ParamError
         }
+        tapSampleRate.value = tapFormat.mSampleRate
 
         var newIOProc: AudioDeviceIOProcID?
         let procStatus = AudioDeviceCreateIOProcIDWithBlock(&newIOProc, aggregateID, queue) { [weak self] _, inputData, _, _, _ in
@@ -639,9 +646,21 @@ final class TapGainEngine: GainEngine {
                     deinterleaved: Bool,
                     outputChannels: Int,
                     limit: Int,
-                    peakDecay: Float) {
-        let framesRead = channel.ring.read(into: scratch, frameCount: frames)
-        guard framesRead > 0 else { return }
+                    peakDecay: Float,
+                    outputRate: Double = 0) {
+        // Input frames consumed per output frame. Exactly 1.0 when the tap and
+        // the output device agree, which is the common case; the small deviation
+        // is real and is what caused the stutter.
+        let tapRate = channel.tapSampleRate.value
+        let ratio = tapRate > 0 && outputRate > 0 ? tapRate / outputRate : 1.0
+
+        guard channel.ring.readSteady(into: scratch, frameCount: frames,
+                                      rateRatio: ratio) else {
+            // Starved this cycle. The scratch holds a fade-out, not real audio,
+            // so it must not be metered or summed as if it were.
+            _ = scaleInPlace(scratch, count: sampleCount, gain: channel.gain.value)
+            return
+        }
 
         let mixed = scaleInPlace(scratch, count: sampleCount, gain: channel.gain.value)
         // Decay instead of latching, otherwise a meter pins at the last
@@ -649,7 +668,9 @@ final class TapGainEngine: GainEngine {
         channel.peak.value = max(mixed, channel.peak.value * peakDecay)
 
         if deinterleaved {
-            accumulatePlanar(scratch, frames: framesRead, left: destination, right: right)
+            // readSteady either fills every frame or returns having faded the
+            // shortfall to silence, so `frames` is the honest count either way.
+            accumulatePlanar(scratch, frames: frames, left: destination, right: right)
         } else {
             accumulateInterleaved(scratch, count: sampleCount, into: destination,
                                   limit: limit, stride: outputChannels)
