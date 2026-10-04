@@ -144,6 +144,10 @@ final class AppModel: ObservableObject {
     /// global tap and prints the level it measures at each step, driving the same
     /// code path the UI does.
     ///
+    /// Whether this launch has already put the permission alert in front of the
+    /// user. See `presentPermissionAlert()`.
+    private var didPresentAlert = false
+
     private func runGainSelfTestIfRequested() {
         guard ProcessInfo.processInfo.environment["VM_SELFTEST"] != nil else { return }
 
@@ -459,6 +463,13 @@ final class AppModel: ObservableObject {
     /// missing: the app cannot do its one job without it, and a silent app is
     /// worse than a slightly persistent one. `PermissionPrompt` owns the backoff.
     func presentPermissionAlert() {
+        // Once per launch. Denial is discovered while an app is muted, so every
+        // automatic re-ask is paid for in the user's silence: the alert offers a
+        // retry, the retry is refused, the denial alerts again. The banner keeps
+        // Open System Settings and Retry available for as long as it is wrong,
+        // which is the right place to answer it deliberately.
+        guard !didPresentAlert else { return }
+        didPresentAlert = true
         PermissionPrompt.presentIfDue { [weak self] in
             Task { @MainActor in self?.retryGainControl() }
         }

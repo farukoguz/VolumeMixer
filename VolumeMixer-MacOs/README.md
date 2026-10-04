@@ -92,6 +92,11 @@ it is paid once rather than every launch:
   whatever happened to be playing.
 - Any tap that is silent is released, whatever the current state is. Holding one
   would leave that app muted with nothing in its place.
+- The permission alert is shown at most once per launch. Denial is discovered by
+  muting an app, so an alert that re-asks itself is not free: it offers a retry,
+  the retry is refused, and the cycle repeats with the user silent each time. The
+  banner keeps **Open System Settings** and **Retry** available meanwhile, which is
+  where a deliberate second attempt belongs.
 
 ## How it works
 

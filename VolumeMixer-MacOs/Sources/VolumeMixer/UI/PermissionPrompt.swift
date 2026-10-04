@@ -34,6 +34,13 @@ enum PermissionPrompt {
     ///   Settings takes effect without relaunching.
     static func presentIfDue(onRetry: @escaping () -> Void) {
         guard !isOnBackoff else { return }
+        // Presenting while one is already up nests a modal inside a modal, and
+        // then their returns interleave: closing the inner one can read as a
+        // button press on the outer one, which retries the taps, which are
+        // refused, which presents another alert.
+        guard !isPresenting else { return }
+        isPresenting = true
+        defer { isPresenting = false }
 
         let alert = NSAlert()
         alert.alertStyle = .warning
@@ -76,6 +83,7 @@ enum PermissionPrompt {
 
     // MARK: - Backoff
 
+    private static var isPresenting = false
     private static let backoff: TimeInterval = 3 * 24 * 60 * 60
 
     private static var isOnBackoff: Bool {
