@@ -20,9 +20,15 @@ enum PermissionPrompt {
 
     /// System Settings' pane for audio capture, which is where
     /// "Screen & System Audio Recording" lives.
+    ///
+    /// Deliberately the screen-capture pane and not the microphone one. Process
+    /// taps are governed by the screen-capture TCC service, so the microphone
+    /// pane is the wrong list to send the user to: Volume Mixer can be listed
+    /// there and switched on, and every tap still returns silence, because
+    /// granting microphone access says nothing about system audio capture.
     static func openSettings() {
         guard let url = URL(string:
-            "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture")
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
         else { return }
         NSWorkspace.shared.open(url)
     }
@@ -54,6 +60,10 @@ enum PermissionPrompt {
 
         Add VolumeMixer to that list with the + button, turn it on, then press
         Try Again here.
+
+        If VolumeMixer is already listed under Microphone, that is a different
+        permission and switching it on will not help. Check the Screen & System
+        Audio Recording list too.
         """
         alert.addButton(withTitle: "Open System Settings")
         alert.addButton(withTitle: "Try Again")

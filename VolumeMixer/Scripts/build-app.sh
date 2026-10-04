@@ -73,13 +73,22 @@ done
 rmdir "$APP/Contents/Resources" 2>/dev/null || true
 rm -f "$BIN"
 
-# Verify the privacy key actually made it into the compiled bundle. TCC denial is
+# Verify the privacy keys actually made it into the compiled bundle. TCC denial is
 # silent, so a missing key here is the single most important thing to catch.
-if ! plutil -extract NSAudioCaptureUsageDescription raw "$APP/Contents/Info.plist" >/dev/null 2>&1; then
-  echo "!! FATAL: NSAudioCaptureUsageDescription missing from bundle -- taps would be silently muted"
-  exit 1
-fi
-echo "    NSAudioCaptureUsageDescription present OK"
+#
+# Both keys are required, and they are not interchangeable. `AudioHardwareCreate-
+# ProcessTap` is gated by TCC under Screen & System Audio Recording, which macOS
+# derives from NSScreenCaptureUsageDescription -- not from the Microphone prompt.
+# With only the audio-capture key the app appears under Microphone, is granted
+# there, and every tap still delivers zeros, because the service that governs
+# process taps was never asked for.
+for key in NSScreenCaptureUsageDescription NSAudioCaptureUsageDescription; do
+    if ! plutil -extract "$key" raw "$APP/Contents/Info.plist" >/dev/null 2>&1; then
+        echo "!! FATAL: $key missing from bundle -- taps would be silently muted"
+        exit 1
+    fi
+    echo "    $key present OK"
+done
 
 # Prefer a real signing identity, because macOS will not grant Screen & System
 # Audio Recording to an ad-hoc build: taps are created, every buffer is zero, and

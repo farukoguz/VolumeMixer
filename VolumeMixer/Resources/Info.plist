@@ -30,6 +30,8 @@
 	<string>Volume Mixer taps each app's audio output so it can adjust that app's volume independently. Audio is processed in memory on this Mac and is never recorded, stored, or transmitted.</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>Volume Mixer taps each app audio output so it can adjust that app volume independently. Audio is processed in memory on this Mac and is never recorded, stored, or transmitted.</string>
 	<key>NSSupportsAutomaticGraphicsSwitching</key>
 	<true/>
 </dict>
