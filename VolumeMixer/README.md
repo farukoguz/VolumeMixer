@@ -111,6 +111,26 @@ shared. `build-app.sh` signs with the first real identity it finds in the
 keychain and says so; without one it signs ad-hoc and warns that Screen & System
 Audio Recording cannot be granted to the resulting build.
 
+### Signing, once per machine
+
+macOS gives every private key its own access list, so the first time `codesign`
+touches a development key it asks for your login password — and asks again on
+every later build until the key trusts it. Run this once:
+
+```sh
+./Scripts/setup-signing.sh
+```
+
+It reads your login password with echo off, grants `codesign` access, and
+discards the password. Nothing is stored, and it is not passed as an argument, so
+it does not reach shell history or `ps` output. After that `build-app.sh` signs
+silently.
+
+The key lives in your login keychain, not in the repository, and it should stay
+that way: anything that can read a private key can sign as you, so the export
+that `setup-signing.sh` suggests for backup is a password-protected file you keep
+off the machine it came from.
+
 ## How it works
 
 ```

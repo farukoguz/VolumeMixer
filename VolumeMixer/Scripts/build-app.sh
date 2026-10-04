@@ -62,7 +62,24 @@ SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
 
 if [ -n "$SIGN_IDENTITY" ]; then
     echo "==> codesigning ($SIGN_IDENTITY)"
-    codesign --force --sign "$SIGN_IDENTITY" --timestamp=none "$APP" 2>&1 | sed 's/^/    /'
+    # errSecInternalComponent here does not mean the bundle is malformed: the
+    # bundle signs ad-hoc without complaint and the same key signs a plain file
+    # without complaint. It means macOS wants to ask whether codesign may use the
+    # private key, and has no way to ask -- a non-interactive session, a script,
+    # an IDE build. Granting that trust once turns this into a silent success.
+    sign_err="$(mktemp)"
+    if ! codesign --force --sign "$SIGN_IDENTITY" --timestamp=none "$APP" 2>"$sign_err"; then
+        sed 's/^/    /' "$sign_err"
+        echo "!! FATAL: could not sign with $SIGN_IDENTITY." >&2
+        if grep -q errSecInternalComponent "$sign_err"; then
+            echo "   macOS is withholding permission to use the signing key and" >&2
+            echo "   cannot prompt here. Grant it once, then build again:" >&2
+            echo "       ./Scripts/setup-signing.sh" >&2
+        fi
+        rm -f "$sign_err"
+        exit 1
+    fi
+    rm -f "$sign_err"
 else
     echo "==> codesigning (ad-hoc, no identity found)"
     echo "    !! Screen & System Audio Recording cannot be granted to this build."
