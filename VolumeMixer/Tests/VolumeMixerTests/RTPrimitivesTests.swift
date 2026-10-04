@@ -775,4 +775,42 @@ struct ReadSteadyTests {
         #expect(out[0] == 1, "the first input frame must come through untouched")
         #expect(out[2] == 2, "and the second, with no resampling in between")
     }
+    @Test("the decimation filter attenuates content it should reject")
+    func decimationFilterIsALowpass() {
+        // A moving average is a lowpass. Alternating samples are the highest
+        // frequency a two-frame-per-output read has to reject, because they are
+        // exactly what folds back into the audible band as an aliased image.
+        let filter = DecimationFilter()
+        var alternating: Float = 1
+        var last: Float = 0
+        for _ in 0..<8 {
+            last = filter.processLeft(alternating, alternating)
+            let right = filter.averageRight
+            #expect(abs(right - last) < 0.0001, "both channels must track together")
+            alternating = -alternating
+        }
+        #expect(abs(last) < 0.5, "a full-scale square wave must be attenuated, not passed")
+    }
+
+    @Test("the decimation filter passes steady content through")
+    func decimationFilterPassesDC() {
+        // A lowpass must not eat the signal it is meant to carry: a constant
+        // input has to come out at its own amplitude, or every app would be
+        // quieter than its slider says.
+        let filter = DecimationFilter()
+        var value: Float = 0
+        // The filter starts with a zeroed history, so the first frames divide a
+        // partial sum by the full tap count and ramp up to unity gain. Measuring
+        // after it has charged measures the steady-state DC gain, which is the
+        // property that decides whether apps play at the right level.
+        for _ in 0..<8 { value = filter.processLeft(0.5, 0.5) }
+        #expect(abs(value - 0.5) < 0.0001, "DC gain must be unity once charged")
+        #expect(abs(filter.averageRight - 0.5) < 0.0001)
+
+        // And it must not overshoot while charging, or the first moments of an
+        // app's audio would be louder than the rest.
+        let fresh = DecimationFilter()
+        let first = fresh.processLeft(0.5, 0.5)
+        #expect(first <= 0.5 + 0.0001, "the filter must not amplify while charging")
+    }
 }

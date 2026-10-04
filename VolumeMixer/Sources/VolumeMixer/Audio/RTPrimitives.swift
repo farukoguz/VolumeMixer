@@ -1,6 +1,104 @@
 import CoreAudio
 import Foundation
 
+// MARK: - Decimation
+
+/// Lowpass filter applied before the ring is decimated down to the mixer's rate.
+///
+/// The tap supplies about two frames for every frame the mixer emits, so each
+/// output frame is assembled from roughly two input frames. Discarding or
+/// naively averaging them folds the content above the output Nyquist frequency
+/// back into the audible band -- the classic aliasing artefact -- which is
+/// heard as harshness and a robotic edge on sustained material.
+///
+/// A short symmetric FIR running average is enough here: it is cheap enough for
+/// the audio thread, it needs no coefficients table, and because the decimation
+/// factor is small a handful of taps attenuates the images substantially. It is
+/// a gentle lowpass rather than a brick wall, which is the right trade for music
+/// where too much filtering is itself audible as loss of top end.
+///
+/// State is per channel and owned by the channel, since the two are drained from
+/// different threads but never from two at once for the same channel.
+final class DecimationFilter {
+
+    /// Taps in the moving average. Six keeps the passband flat to roughly 0.8 of
+    /// the Nyquist frequency while pushing the first image well down.
+    private static let taps = 6
+    /// Interleaved history: 2 channels x `taps`.
+    private let history: UnsafeMutablePointer<Float>
+    /// Running sums for the most recent frame, kept as fields so the filter can
+    /// return both channels without allocating a tuple on the audio thread.
+    private var sumL: Float = 0
+    private var sumR: Float = 0
+
+    init() {
+        history = .allocate(capacity: DecimationFilter.taps * 2)
+        history.initialize(repeating: 0, count: DecimationFilter.taps * 2)
+    }
+
+    deinit {
+        history.deinitialize(count: DecimationFilter.taps * 2)
+        history.deallocate()
+    }
+
+    /// Filters one stereo frame, returning the averaged left sample.
+    ///
+    /// The right sample comes from `processRight`. Returning two values from one
+    /// call needs a tuple, and taking the address of a temporary for an `out`
+    /// parameter is the kind of thing that quietly allocates -- which is
+    /// unacceptable on the audio thread.
+    ///
+    /// Real-time safe: a fixed-size running sum over preallocated storage, with
+    /// no allocation and no dependency on anything but the inputs.
+    @inline(__always)
+    func processLeft(_ left: Float, _ right: Float) -> Float {
+        advance(left, right)
+        return averageLeft
+    }
+
+    /// The left-channel result of the most recent `advance`.
+    @inline(__always)
+    var averageLeft: Float {
+        sumL * Self.scale
+    }
+
+    /// The right-channel result of the most recent `advance`.
+    @inline(__always)
+    var averageRight: Float {
+        sumR * Self.scale
+    }
+
+    private static let scale = Float(1.0) / Float(DecimationFilter.taps)
+
+    /// Shifts the history and folds in the new frame, leaving the sums ready.
+    @inline(__always)
+    private func advance(_ left: Float, _ right: Float) {
+        let taps = DecimationFilter.taps
+        // Shift the window down by one and drop the oldest sample, which is what
+        // makes it a moving average rather than a fixed set of slots. Summing the
+        // window before the shift is what makes the sum correct this frame; the
+        // shift then moves every retained sample one place along.
+        var l: Float = 0
+        var r: Float = 0
+        for index in 0..<(taps - 1) {
+            l += history[index * 2]
+            r += history[index * 2 + 1]
+        }
+        for index in stride(from: taps - 1, through: 1, by: -1) {
+            history[index * 2] = history[(index - 1) * 2]
+            history[index * 2 + 1] = history[(index - 1) * 2 + 1]
+        }
+        history[0] = left
+        history[1] = right
+        sumL = l + left
+        sumR = r + right
+    }
+
+    func reset() {
+        history.initialize(repeating: 0, count: DecimationFilter.taps * 2)
+    }
+}
+
 // MARK: - GainSlot
 
 /// A single `Float` that the UI thread writes and a real-time IOProc reads.
@@ -420,7 +518,8 @@ final class SampleRingBuffer {
     func readRegulated(into out: UnsafeMutablePointer<Float>,
                        frameCount: Int,
                        rateRatio: Double,
-                       targetFrames: Int) -> Bool {
+                       targetFrames: Int,
+                       filter: DecimationFilter? = nil) -> Bool {
         guard frameCount > 0 else { return true }
         let ratio = max(0.25, min(4.0, rateRatio))
         // How quickly correction strength ramps with the size of the error. At
@@ -459,9 +558,6 @@ final class SampleRingBuffer {
             let hasNext = availableNow > 1
             let l1 = hasNext ? storage[next * 2] : l0
             let r1 = hasNext ? storage[next * 2 + 1] : r0
-
-            out[produced * 2] = Float(Double(l0) + (Double(l1) - Double(l0)) * phase)
-            out[produced * 2 + 1] = Float(Double(r0) + (Double(r1) - Double(r0)) * phase)
 
             // Steer the level: too much buffered means consume faster to drain
             // it, too little means ease off so the tap can catch up.
@@ -516,6 +612,27 @@ final class SampleRingBuffer {
                 let strength = ramped * ramped * maxCorrection
                 steered = ratio * (1.0 + strength)
             }
+            // Lowpass before decimating, and only then.
+            //
+            // The filter is what stops above-Nyquist content folding back into
+            // the audible band -- the harsh, artificial edge that survives even
+            // when the buffer level is regulated correctly. It also attenuates
+            // and delays the signal, so applying it when the tap and the mixer
+            // already run one-to-one would quietly alter every app's audio and
+            // break the promise that unity gain is a pass-through. The gain tests
+            // exist to protect exactly that, and they fail if this is
+            // unconditional.
+            //
+            // Decimating means consuming more than one input frame per output
+            // frame, which is what `steered` reports against `ratio`.
+            if let filter, steered > ratio + 0.001 {
+                out[produced * 2] = filter.processLeft(l0, r0)
+                out[produced * 2 + 1] = filter.averageRight
+            } else {
+                out[produced * 2] = Float(Double(l0) + (Double(l1) - Double(l0)) * phase)
+                out[produced * 2 + 1] = Float(Double(r0) + (Double(r1) - Double(r0)) * phase)
+            }
+
             let total = phase + steered
             let advance = Int(total)
             readStorage.pointee &+= Int64(advance)

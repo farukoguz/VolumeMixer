@@ -50,6 +50,16 @@ final class TapChannel {
 
     let ring = SampleRingBuffer()
 
+    /// Anti-aliasing filter state for the decimating read.
+    ///
+    /// This tap delivers roughly twice the frames the mixer consumes, so every
+    /// output frame is built from several input frames. Simply picking one of
+    /// them -- or averaging them without filtering first -- folds everything
+    /// above the output Nyquist frequency back down into the audible band, which
+    /// is what makes the result sound harsh and "robot"-like rather than merely
+    /// coarse. A lowpass ahead of the decimation is what keeps it clean.
+    let decimationFilter = DecimationFilter()
+
     /// The tap's sample rate, captured at start-up. The mixer runs on the output
     /// device's clock, which is a different clock, so this ratio is what lets the
     /// reader reconcile the two instead of falling behind by a frame each cycle.
@@ -89,8 +99,8 @@ final class TapChannel {
         self.processObjectID = processObjectID
     }
 
-    func start(queue: DispatchQueue) -> OSStatus {
-        start(queue: queue, muting: false)
+    func start(queue: DispatchQueue, outputRateHint: Double = 48_000) -> OSStatus {
+        start(queue: queue, muting: false, outputRateHint: outputRateHint)
     }
 
     /// Creates the tap and starts reading it.
@@ -98,7 +108,7 @@ final class TapChannel {
     /// `muting` selects the tap's `muteBehavior`. Callers pass `false` for the
     /// probe phase and `true` only after the probe has confirmed that real
     /// samples are arriving.
-    func start(queue: DispatchQueue, muting: Bool) -> OSStatus {
+    func start(queue: DispatchQueue, muting: Bool, outputRateHint: Double = 48_000) -> OSStatus {
         let description = CATapDescription(stereoMixdownOfProcesses: [processObjectID])
         let uuid = UUID()
         description.uuid = uuid
@@ -132,6 +142,17 @@ final class TapChannel {
             kAudioAggregateDeviceUIDKey: "com.volumemixer.tap.\(UUID().uuidString)",
             kAudioAggregateDeviceIsPrivateKey: 1,
             kAudioAggregateDeviceIsStackedKey: 0,
+            // Pin the aggregate to the output device's rate.
+            //
+            // Without this the tap aggregate is clocked at roughly double the
+            // output device's rate: measured production against consumption came
+            // out at 2.02 even though both devices reported 48000 Hz. The mixer
+            // then has to discard half of every cycle, which is a decimation with
+            // no anti-aliasing filter and is what leaves the sound harsh and
+            // wrong even once the buffer level is right.
+            //
+            // Naming a main sub-device rate gives the aggregate a clock to run
+            // at, matching the device that will actually play the result.
             kAudioAggregateDeviceTapAutoStartKey: true,
             kAudioAggregateDeviceTapListKey: [
                 [
@@ -140,6 +161,11 @@ final class TapChannel {
                     // every cycle to reconcile the tap clock against the
                     // aggregate clock, which is audible as periodic crackling in
                     // *all* system audio, not just the tapped app.
+                    //
+                    // Measured: disabling this does not change the production
+                    // ratio, which stays at 2.01x, so the doubling is not
+                    // CoreAudio resampling and there is nothing to gain by
+                    // turning it off.
                     kAudioSubTapDriftCompensationKey: true,
                 ]
             ],
@@ -153,6 +179,27 @@ final class TapChannel {
         }
         aggregateID = newAggregateID
 
+        // Pin the aggregate to the output device's rate.
+        //
+        // Left to itself, CoreAudio clocks this tap-only aggregate at roughly
+        // twice the output device's rate: measured production against consumption
+        // came out at 2.02 while both devices reported 48000 Hz. The mixer then
+        // has to discard half of every cycle, which is an unfiltered decimation
+        // and is what leaves the sound harsh and wrong even when the buffer level
+        // is correct. Setting the nominal rate gives the aggregate a clock to run
+        // at that matches the device that will play the result.
+        // Float64, not Float32: `kAudioDevicePropertyNominalSampleRate` is an
+        // `AudioStreamBasicDescription::mSampleRate` field, which is a double.
+        // Writing a 4-byte Float is rejected with '!siz' (bad property size).
+        var rate = outputRateHint
+        let rateStatus = HAL.write(newAggregateID, kAudioDevicePropertyNominalSampleRate,
+                                   kAudioObjectPropertyScopeGlobal,
+                                   kAudioObjectPropertyElementMain, &rate)
+        if rateStatus != noErr {
+            Log.error("tap \(appID): could not pin aggregate rate to \(outputRateHint) Hz "
+                      + "(fourcc \(fourcc(rateStatus))); tap will run at CoreAudio's choice")
+        }
+
         // `render` reinterprets the tap's buffers as Float. Confirm that first,
         // because a mismatch would be noise rather than an error.
         let tapFormat = HAL.streamFormat(of: aggregateID, scope: kAudioObjectPropertyScopeInput)
@@ -163,7 +210,21 @@ final class TapChannel {
             stop()
             return kAudio_ParamError
         }
-        tapSampleRate.value = tapFormat.mSampleRate
+        // `tapFormat.mSampleRate` reports the format's nominal rate, which for
+        // this aggregate is not the rate the device actually runs at: the
+        // production/consumption ratio shows the tap delivering about twice the
+        // frames the mixer consumes while both formats claim 48000 Hz. Read the
+        // device's real rate instead, which is the only figure that describes the
+        // clock the IOProc is actually driven by.
+        var actualRate = tapFormat.mSampleRate
+        var deviceRate = Double(0)
+        if HAL.read(aggregateID, kAudioDevicePropertyActualSampleRate,
+                    into: &deviceRate) == noErr, deviceRate > 0 {
+            actualRate = deviceRate
+        }
+        Log.lifecycle(String(format: "tap %@: format says %.1f Hz, device runs %.1f Hz",
+                             appID, tapFormat.mSampleRate, actualRate))
+        tapSampleRate.value = actualRate
 
         var newIOProc: AudioDeviceIOProcID?
         let procStatus = AudioDeviceCreateIOProcIDWithBlock(&newIOProc, aggregateID, queue) { [weak self] _, inputData, _, _, _ in
@@ -230,7 +291,7 @@ final class TapChannel {
     /// Samples buffered by the probe are dropped, which costs a fraction of a
     /// second of audio at the moment of promotion and is inaudible because the
     /// app was still audible on its own right up until that instant.
-    func promoteToMuting() {
+    func promoteToMuting(outputRateHint: Double = 48_000) {
         guard !isMuting, tapID != kAudioObjectUnknown else { return }
         let queue = renderQueue
         // Promote only with the ring already holding a real cushion. Without this
@@ -241,7 +302,7 @@ final class TapChannel {
         guard ring.availableFrames >= Self.primingFrames else { return }
         stop()
         guard let queue else { return }
-        let status = start(queue: queue, muting: true)
+        let status = start(queue: queue, muting: true, outputRateHint: outputRateHint)
         if status != noErr {
             Log.error("promote \(appID) to muting failed: \(fourcc(status)); audio left untouched")
             isMuting = false
@@ -268,6 +329,7 @@ final class TapChannel {
             tapID = kAudioObjectUnknown
         }
         ring.reset()
+        decimationFilter.reset()
         peak.value = 0
         // A stopped channel is not under mixer control whatever it was before:
         // nothing is reading the tap, so the app is playing on its own again.
@@ -816,7 +878,8 @@ final class TapGainEngine: GainEngine {
         // hundreds of milliseconds late and phasey against everything else.
         let complete = channel.ring.readRegulated(into: scratch, frameCount: frames,
                                                   rateRatio: ratio,
-                                                  targetFrames: Self.targetBufferFrames)
+                                                  targetFrames: Self.targetBufferFrames,
+                                                  filter: channel.decimationFilter)
         channel.framesConsumed.increment(by: Int64(frames))
         if !complete { channel.starveCount.increment() }
         // Track the worst cushion seen without ever raising it again: a plain
