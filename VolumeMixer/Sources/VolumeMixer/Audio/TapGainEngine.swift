@@ -6,9 +6,19 @@ import Foundation
 /// only that tap, and an IOProc that copies its samples into a ring buffer for
 /// the mixer.
 ///
-/// The tap's `muteBehavior` is `mutedWhenTapped`: the app is silenced from the
-/// speakers only while this IOProc is reading the tap, so it is never heard
-/// twice and never silently swallowed either.
+/// Tapping starts as a *probe*: the tap is created with
+/// `muteBehavior = .unmutedWhenTapped`, so the app keeps playing normally and
+/// the tap runs purely as a listener. Only once real non-zero samples have been
+/// seen -- proof that capture is actually permitted -- does the channel promote
+/// itself to `.mutedWhenTapped` and take over the app's output.
+///
+/// The ordering matters. `mutedWhenTapped` silences the app for as long as the
+/// tap is running, on the assumption that the mixer will put the audio back.
+/// When capture permission is missing the tap still reports success and simply
+/// delivers zeros, so muting first means the app is silenced by a path that is
+/// going to hand back nothing. Probing first means the worst case of a denied
+/// permission is that the app is briefly listened to rather than muted, which is
+/// harmless.
 @available(macOS 14.2, *)
 final class TapChannel {
 
@@ -23,6 +33,14 @@ final class TapChannel {
     private(set) var tapID: AudioObjectID = kAudioObjectUnknown
     private(set) var aggregateID: AudioObjectID = kAudioObjectUnknown
     private var ioProcID: AudioDeviceIOProcID?
+
+    /// Whether this channel's tap is currently silencing its app. False during
+    /// the probe phase, which is what keeps an unverified tap from damaging
+    /// audio. Read by the watchdog to decide whether promotion is due.
+    private(set) var isMuting = false
+    /// The queue the IOProc was created on, kept so promotion can rebuild the
+    /// tap on the same queue without the caller having to remember it.
+    private var renderQueue: DispatchQueue?
 
     let gain = GainSlot(1.0)
     let peak = PeakSlot(0)
@@ -43,6 +61,11 @@ final class TapChannel {
     /// that happens to produce zeros, so this is how denial is detected.
     /// Atomic because the watchdog reads it from another thread.
     let sawAudio = AtomicFlag()
+    /// True once this channel has been promoted from probe to muting tap, or
+    /// started that way. Distinct from `sawAudio`: a muting tap can legitimately
+    /// be sitting on a silent app, in which case no audio flows but nothing is
+    /// wrong either.
+    let isUnderMixerControl = AtomicFlag()
     /// Frames copied out of the tap and into the ring, for the same reason.
     let framesCounter = FrameCounter()
     var framesCopied: Int64 { framesCounter.value }
@@ -54,12 +77,27 @@ final class TapChannel {
     }
 
     func start(queue: DispatchQueue) -> OSStatus {
+        start(queue: queue, muting: false)
+    }
+
+    /// Creates the tap and starts reading it.
+    ///
+    /// `muting` selects the tap's `muteBehavior`. Callers pass `false` for the
+    /// probe phase and `true` only after the probe has confirmed that real
+    /// samples are arriving.
+    func start(queue: DispatchQueue, muting: Bool) -> OSStatus {
         let description = CATapDescription(stereoMixdownOfProcesses: [processObjectID])
         let uuid = UUID()
         description.uuid = uuid
         description.name = "VolumeMixer-\(appID)"
         description.isPrivate = true
-        description.muteBehavior = .mutedWhenTapped
+        // `.unmuted` rather than `.mutedWhenTapped` during the probe: this tap
+        // only listens. Under `.mutedWhenTapped` CoreAudio silences the app for
+        // as long as anything reads the tap, so a probe would mute the app while
+        // having nothing to replace it with if permission turns out to be denied.
+        description.muteBehavior = muting ? .mutedWhenTapped : .unmuted
+        isMuting = muting
+        isUnderMixerControl.value = muting
 
         var newTapID: AudioObjectID = kAudioObjectUnknown
         let tapStatus = AudioHardwareCreateProcessTap(description, &newTapID)
@@ -118,6 +156,7 @@ final class TapChannel {
             return procStatus
         }
         ioProcID = ioProc
+        renderQueue = queue
 
         let startStatus = AudioDeviceStart(aggregateID, ioProc)
         guard startStatus == noErr else {
@@ -164,6 +203,27 @@ final class TapChannel {
         }
     }
 
+    /// Rebuilds this channel's tap with `muteBehavior = .mutedWhenTapped`,
+    /// handing the app's output over to the mixer.
+    ///
+    /// Called on the control queue once another tap has proven that capture
+    /// works. The teardown-then-rebuild is deliberate: `muteBehavior` is fixed at
+    /// tap creation, so the tap has to be replaced rather than reconfigured.
+    /// Samples buffered by the probe are dropped, which costs a fraction of a
+    /// second of audio at the moment of promotion and is inaudible because the
+    /// app was still audible on its own right up until that instant.
+    func promoteToMuting() {
+        guard !isMuting, tapID != kAudioObjectUnknown else { return }
+        let queue = renderQueue
+        stop()
+        guard let queue else { return }
+        let status = start(queue: queue, muting: true)
+        if status != noErr {
+            Log.error("promote \(appID) to muting failed: \(fourcc(status)); audio left untouched")
+            isMuting = false
+        }
+    }
+
     func stop() {
         if let ioProc = ioProcID {
             _ = AudioDeviceStop(aggregateID, ioProc)
@@ -180,6 +240,10 @@ final class TapChannel {
         }
         ring.reset()
         peak.value = 0
+        // A stopped channel is not under mixer control whatever it was before:
+        // nothing is reading the tap, so the app is playing on its own again.
+        isUnderMixerControl.value = false
+        isMuting = false
     }
 }
 
@@ -302,7 +366,10 @@ final class TapGainEngine: GainEngine {
                                          processKey: app.processKey,
                                          processObjectID: app.processObjectID)
                 guard self.channels[channel.appID] == nil else { return }
-                let status = channel.start(queue: self.tapQueue)
+                // Start muted only once capture has been proven this session. Until then
+                // the tap is a passive probe, so an app whose audio we cannot
+                // capture keeps playing instead of being silenced.
+                let status = channel.start(queue: self.tapQueue, muting: self.captureProven)
                 guard status == noErr else {
                     Log.error("tap start failed for \(channel.appID): \(fourcc(status))")
                     return
@@ -721,6 +788,15 @@ final class TapGainEngine: GainEngine {
     /// and the samples are all zero. The only way to tell that apart from a
     /// genuinely silent app is to watch for taps that move frames but never move
     /// them anywhere.
+    ///
+    /// Each tick does one of two things per channel:
+    ///
+    /// - A probe that has seen real audio is promoted to a muting tap. Promotion
+    ///   is what hands control of the app's output to the mixer, so it only
+    ///   happens once the replacement path is known to carry audio.
+    /// - A probe that has moved frames but never produced any is evidence of a
+    ///   denied permission, and is torn down. Tearing down a probe is silent by
+    ///   construction, because a probe never muted anything.
     private func detectPermissionDenial() {
         guard mixerProcID != nil, !channels.isEmpty else {
             silentTicks = 0
@@ -728,8 +804,21 @@ final class TapGainEngine: GainEngine {
         }
         let copying = channels.values.contains { $0.framesCopied > 0 }
         let audible = channels.values.contains { $0.sawAudio.value }
-        guard copying, !audible else {
+        // Silence only counts as a denied permission while some channel is still
+        // a probe. Once capture has been proven, a channel that goes quiet is
+        // most likely an app that simply stopped playing, and tearing every tap
+        // down on that basis would kill gain control for apps that are merely
+        // idle.
+        let probing = channels.values.contains { !$0.isUnderMixerControl.value }
+        guard copying, !audible, probing else {
             silentTicks = 0
+            // At least one tap is proven good, which also proves the permission
+            // is granted. Any probe still lingering can safely go to muting now,
+            // because its samples have somewhere to go.
+            if audible {
+                noteCaptureProven()
+                promoteVerifiedProbes()
+            }
             return
         }
         silentTicks += 1
@@ -754,6 +843,35 @@ final class TapGainEngine: GainEngine {
         // has never produced a sample would leave that app muted with nothing
         // replacing it, which is worse than the condition being detected.
         releaseAllTaps(reason: "taps deliver only silence")
+    }
+
+    /// Rebuilds probe taps as muting taps now that capture has been proven.
+    ///
+    /// Safe because promotion only runs once some tap has carried non-zero
+    /// samples: the permission is granted and the mixer is demonstrably moving
+    /// real audio, so taking over an app's output is a swap rather than a loss.
+    private func promoteVerifiedProbes() {
+        let pending = channels.values.filter { !$0.isMuting }
+        guard !pending.isEmpty else { return }
+        for channel in pending {
+            Log.lifecycle("promoting verified tap to muting: \(channel.appID)")
+            channel.promoteToMuting()
+        }
+    }
+
+    /// Latches the fact that capture is known to work, so channels attached
+    /// later start directly as muting taps instead of probing.
+    ///
+    /// Probing every newly attached app would work, but it would also mean each
+    /// one starts out listening rather than under mixer control -- briefly louder
+    /// than the user's slider says. Once any tap has proven the permission,
+    /// attachment can go straight to the controlled state.
+    private var captureProven = false
+
+    private func noteCaptureProven() {
+        guard !captureProven else { return }
+        captureProven = true
+        Log.lifecycle("audio capture proven; new taps will mute from the start")
     }
 
     /// Destroys every tap and stops the mixer. This is the single recovery path
