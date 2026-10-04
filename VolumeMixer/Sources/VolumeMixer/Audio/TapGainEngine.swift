@@ -731,6 +731,17 @@ final class TapGainEngine: GainEngine {
 
         table.forEach { object, _ in
             guard let channel = object as? TapChannel else { return }
+            // Only channels whose tap is actually muting may be summed.
+            //
+            // A probe tap is created with `.unmuted`, so the app is already
+            // playing through the hardware on its own. Adding its samples here
+            // would put the same audio into the output a second time, a fraction
+            // of a millisecond apart. Two copies of one signal offset in time is
+            // comb filtering, which is heard as a hollow, phasey, "robotic"
+            // version of the original -- and it is most audible on sustained
+            // material like a pad or a held vocal, which is exactly where a
+            // listener notices the sound has changed.
+            guard channel.isUnderMixerControl.value else { return }
             TapGainEngine.mix(channel, scratch: scratch, frames: usableFrames,
                               sampleCount: sampleCount, destination: destination, right: right,
                               deinterleaved: deinterleaved, outputChannels: outputChannels,
