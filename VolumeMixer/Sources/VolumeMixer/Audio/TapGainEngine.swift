@@ -106,7 +106,9 @@ final class TapChannel {
         description.muteBehavior = muting ? .mutedWhenTapped : .unmuted
         isMuting = muting
         isUnderMixerControl.value = muting
-        minBuffered.value = Double.greatestFiniteMagnitude
+        // 0 until first observed: the audio thread lowers it, and an
+        // initial sentinel of "infinity" prints as garbage in the health log.
+        minBuffered.value = 0
         starveCount.value = 0
 
         var newTapID: AudioObjectID = kAudioObjectUnknown
@@ -917,10 +919,34 @@ final class TapGainEngine: GainEngine {
     /// real audio, so taking over an app's output is a swap rather than a loss.
     private func promoteVerifiedProbes() {
         let pending = channels.values.filter { !$0.isMuting }
+        reportBufferHealth()
         guard !pending.isEmpty else { return }
         for channel in pending {
             Log.lifecycle("promoting verified tap to muting: \(channel.appID)")
             channel.promoteToMuting()
+        }
+    }
+
+    /// Reports buffer health periodically while the mixer runs.
+    ///
+    /// The shutdown dump is too late to be useful when the problem is "the sound
+    /// is wrong right now": by then the user has already formed an opinion and
+    /// the cycles in question are gone. Reporting every couple of seconds gives a
+    /// live view of whether the mixer is keeping up with the taps, which is the
+    /// question that actually distinguishes an underrun from correct behaviour.
+    private var lastHealthReport = Date.distantPast
+
+    private func reportBufferHealth() {
+        let now = Date()
+        guard now.timeIntervalSince(lastHealthReport) >= 2 else { return }
+        lastHealthReport = now
+        for channel in channels.values {
+            let role = channel.isUnderMixerControl.value ? "muting" : "probe"
+            Log.lifecycle(String(
+                format: "health %@ [%@]: starved %lld cycle(s), low-water %.0f frames, buffered %d, tapRate %.1f Hz",
+                channel.appID, role, channel.starveCount.value,
+                channel.minBuffered.value, channel.ring.availableFrames,
+                channel.tapSampleRate.value))
         }
     }
 
