@@ -8,6 +8,8 @@
 	<string>Volume Mixer</string>
 	<key>CFBundleExecutable</key>
 	<string>VolumeMixer</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.volumemixer.app</string>
 	<key>CFBundleInfoDictionaryVersion</key>

@@ -29,3 +29,6 @@ replay_pid*
 # SwiftPM / app build output
 .build/
 build/
+
+# Icon generator intermediate; the .icns is the tracked artefact
+VolumeMixer.iconset/

@@ -351,3 +351,19 @@ Known limitations:
 | `Support/Log.swift` | os_log plus optional stdout mirroring |
 | `UI/MixerView.swift` | menu bar panel |
 | `Diagnostics/SystemAudioMeter.swift` | global tap that measures system level, for `verify-gain.sh` |
+| `Scripts/make-icon.swift` | draws `Resources/AppIcon.icns` from code |
+| `Resources/AppIcon.icns` | the bundle icon, named by `CFBundleIconFile` |
+
+### Regenerating the icon
+
+```sh
+./Scripts/make-icon.swift
+```
+
+The icon is drawn with Core Graphics rather than checked in as binary art, so it
+can be reviewed as a diff. The generator renders every size from one 1024-unit
+description and then fails loudly rather than quietly producing a wrong picture:
+it asserts that every parsed path lands inside the body, that the mark is
+centred, and — because an arc at partial opacity is invisible to any brightness
+threshold — that the composited mark stays inside the body and is not lopsided.
+Run it after changing any path string.
