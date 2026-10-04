@@ -23,9 +23,26 @@ BIN="$(swift build -c "$CONFIG" --show-bin-path)/VolumeMixer"
 
 echo "==> assembling $APP"
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+mkdir -p "$APP/Contents/MacOS"
 cp "$BIN" "$APP/Contents/MacOS/VolumeMixer"
 cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
+
+# Copy anything else that lives beside Info.plist (an app icon, a preset) into
+# Contents/Resources. The directory is deliberately not created unconditionally:
+# an empty Contents/Resources makes codesign record a signature that claims
+# resources are present, and the bundle then fails its own verification with
+# "code has no resources but signature indicates they must be present".
+shopt -s nullglob
+resources=("$ROOT/Resources"/*)
+shopt -u nullglob
+for item in "${resources[@]}"; do
+    case "$(basename "$item")" in
+        Info.plist) continue ;;
+    esac
+    mkdir -p "$APP/Contents/Resources"
+    cp -R "$item" "$APP/Contents/Resources/"
+done
+rmdir "$APP/Contents/Resources" 2>/dev/null || true
 
 # Verify the privacy key actually made it into the compiled bundle. TCC denial is
 # silent, so a missing key here is the single most important thing to catch.

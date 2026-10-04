@@ -98,6 +98,19 @@ it is paid once rather than every launch:
   banner keeps **Open System Settings** and **Retry** available meanwhile, which is
   where a deliberate second attempt belongs.
 
+## Building
+
+```sh
+swift test          # 56 tests, no audio hardware needed
+./Scripts/build-app.sh
+```
+
+The bundle is written to `build/VolumeMixer.app` and is gitignored: it carries a
+code signature tied to one machine's identity, and it is rebuilt rather than
+shared. `build-app.sh` signs with the first real identity it finds in the
+keychain and says so; without one it signs ad-hoc and warns that Screen & System
+Audio Recording cannot be granted to the resulting build.
+
 ## How it works
 
 ```
