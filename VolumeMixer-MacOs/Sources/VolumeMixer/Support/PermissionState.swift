@@ -20,6 +20,7 @@ enum PermissionState {
 
     private static let key = "hasRequestedAudioCapture"
     private static let declinedAtKey = "audioCapturePromptDeclinedAt"
+    private static let deniedAtKey = "audioCaptureDeniedAt"
 
     static var hasRequestedAudioCapture: Bool {
         get { UserDefaults.standard.bool(forKey: key) }
@@ -44,5 +45,26 @@ enum PermissionState {
 
     static func clearDecline() {
         lastDeclinedAt = nil
+    }
+
+    /// When a tap was last caught delivering nothing but silence, meaning macOS
+    /// is withholding capture.
+    ///
+    /// Recorded so a later launch can skip the check entirely. The check costs
+    /// the user real audio: a tap mutes the app it reads, so every launch that
+    /// rediscovers the refusal spends seconds muting whatever happens to be
+    /// playing. Believing the earlier answer keeps that from happening once per
+    /// launch, and a user who has since granted access clears it by hitting Retry.
+    static var captureDeniedAt: Date? {
+        get { UserDefaults.standard.object(forKey: deniedAtKey) as? Date }
+        set { UserDefaults.standard.set(newValue, forKey: deniedAtKey) }
+    }
+
+    static func recordDenial() {
+        captureDeniedAt = Date()
+    }
+
+    static func clearDenial() {
+        captureDeniedAt = nil
     }
 }

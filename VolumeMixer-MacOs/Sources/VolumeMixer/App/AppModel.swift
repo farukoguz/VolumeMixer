@@ -93,6 +93,14 @@ final class AppModel: ObservableObject {
         // availability check, not a permission check: whether access was granted
         // can only be observed by inspecting samples, because a refused tap still
         // reports success.
+        // A refusal recorded by an earlier launch is worth believing: tapping
+        // again to re-confirm it would cost the user whichever app is playing.
+        if let tapEngine = engine as? TapGainEngine, PermissionState.captureDeniedAt != nil {
+            tapEngine.suppressTaps()
+            engineStatus = .permissionDenied
+            presentPermissionAlert()
+        }
+
         if let tapEngine = engine as? TapGainEngine, !PermissionState.hasRequestedAudioCapture {
             // Recorded before the tap is created, so being killed mid-preflight
             // cannot leave us asking again on the next launch.
@@ -176,19 +184,30 @@ final class AppModel: ObservableObject {
     @MainActor
     private func firstChannelID() -> String? { channels.first?.id }
 
-    /// Applies a level through the same path the slider uses, so the test covers
-    /// the real code and not a private back door.
+    /// Applies a level through the engine, exactly as the slider does, but
+    /// without persisting it.
+    ///
+    /// The obvious implementation -- calling `setGain` -- was a mistake: it saves
+    /// to disk, so a sweep that was interrupted left the user's real settings
+    /// rewritten to whatever the test last set. A run that was killed half way
+    /// through once left an app muted at half volume, and the app has no way to
+    /// tell that apart from a level the user chose.
+    ///
+    /// Persistence is the one part of the slider's path worth skipping here,
+    /// because it is the only part with effects outside the audio graph.
     private func applyGain(_ gain: Float) {
         Task { @MainActor [weak self] in
-            guard let self, let id = self.firstChannelID() else { return }
-            self.setGain(gain, for: id)
+            guard let self, let index = self.channels.firstIndex(where: { _ in true }) else { return }
+            self.channels[index].gain = gain
+            self.engine.setGain(gain, for: self.channels[index].id)
         }
     }
 
     private func applyMuted(_ muted: Bool) {
         Task { @MainActor [weak self] in
-            guard let self, let id = self.firstChannelID() else { return }
-            self.setMuted(muted, for: id)
+            guard let self, let index = self.channels.firstIndex(where: { _ in true }) else { return }
+            self.channels[index].muted = muted
+            self.engine.setMuted(muted, for: self.channels[index].id)
         }
     }
 
@@ -365,6 +384,7 @@ final class AppModel: ObservableObject {
             // rather than only in the panel is the point: by now the user has
             // usually already concluded the app just does not work.
             if case .permissionDenied = engine.availability {
+                PermissionState.recordDenial()
                 presentPermissionAlert()
             }
         }
@@ -458,6 +478,7 @@ final class AppModel: ObservableObject {
         guard let tapEngine = engine as? TapGainEngine else { return }
         // Asking again is a deliberate act, so it clears any earlier dismissal.
         PermissionPrompt.retryRequested()
+        PermissionState.clearDenial()
         tapEngine.resetAfterDenial()
         engineStatus = .ready
 

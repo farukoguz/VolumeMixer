@@ -235,6 +235,9 @@ final class TapGainEngine: GainEngine {
     /// Consecutive watchdog ticks spent with taps that copy frames but never see
     /// a non-zero sample, which is how audio-capture denial looks from here.
     private var silentTicks = 0
+    /// Watchdog ticks of a silent tap before it is released. Each tick is a
+    /// second, and each is also a second the user cannot hear that app.
+    private static let denialTicks = 3
     /// How long a freshly started mixer is given to produce its first cycle.
     private let mixerStartupGrace: TimeInterval = 3
     /// Deadline before which a missing cycle is not yet a stall.
@@ -283,6 +286,11 @@ final class TapGainEngine: GainEngine {
         controlQueue.async { [weak self] in
             guard let self, !self.isShutDown else { return }
             self.stateLock.withLock {
+                // A tap mutes the app it reads. Once capture has been shown not to
+                // work, tapping again buys nothing and costs the user their
+                // audio: without this the next app to play was muted and then,
+                // because the watchdog only reports a denial once, never released.
+                guard self.availability != .permissionDenied else { return }
                 let channel = TapChannel(identity: identity,
                                          processKey: app.processKey,
                                          processObjectID: app.processObjectID)
@@ -704,18 +712,27 @@ final class TapGainEngine: GainEngine {
             return
         }
         silentTicks += 1
-        // Five seconds of an "audible" app producing pure silence from a tap
-        // that is demonstrably running is not a coincidence.
-        guard silentTicks >= 5, availability == .ready else { return }
-        availability = .permissionDenied
-        Log.error("taps deliver only silence: releasing taps, system audio capture is not permitted")
+        // Three seconds of a tapped app producing pure silence from a tap that is
+        // demonstrably running is not a coincidence. This threshold is also the
+        // length of time the user spends hearing nothing, because the tap has
+        // muted the app for the duration, so it is a damage figure rather than a
+        // confidence figure.
+        guard silentTicks >= Self.denialTicks else { return }
+        if availability == .ready {
+            availability = .permissionDenied
+            Log.error("taps deliver only silence: system audio capture is not permitted")
+        }
 
         // A tap mutes its app while it is being read. Whatever CoreAudio decides
         // a denied tap means, the only safe response is to stop tapping: if the
         // mute engaged we have been silencing apps, and if it did not we were
         // reinjecting nothing for no reason. Either way, releasing them restores
         // ordinary system audio.
-        releaseAllTaps(reason: "permission denied")
+        //
+        // This runs for every silent tap, not only the first. Holding a tap that
+        // has never produced a sample would leave that app muted with nothing
+        // replacing it, which is worse than the condition being detected.
+        releaseAllTaps(reason: "taps deliver only silence")
     }
 
     /// Destroys every tap and stops the mixer. This is the single recovery path
@@ -732,6 +749,22 @@ final class TapGainEngine: GainEngine {
         }
         stopMixer()
         Log.lifecycle("released \(released.count) tap(s): \(reason)")
+    }
+
+    /// Starts the session already knowing capture is not permitted.
+    ///
+    /// Set from a denial recorded by an earlier launch. Opening taps again would
+    /// only mute whichever app is playing for the length of the detection window
+    /// before the app reached the conclusion it already has on file.
+    func suppressTaps() {
+        controlQueue.async { [weak self] in
+            guard let self else { return }
+            self.stateLock.withLock {
+                self.silentTicks = 0
+                self.availability = .permissionDenied
+            }
+            Log.lifecycle("capture already known to be unavailable: not opening any taps")
+        }
     }
 
     /// Clears a detected denial so the taps can be tried again, after the user

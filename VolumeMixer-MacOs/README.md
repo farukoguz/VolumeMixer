@@ -71,7 +71,7 @@ time something plays without permission, not at launch.
 
 TCC denial is reported as *success* at every API call site: taps are created, the
 aggregate device starts, and the buffers contain zeros. VolumeMixer therefore
-decides permission by inspecting samples — five consecutive seconds of taps that
+decides permission by inspecting samples — three consecutive seconds of taps that
 copy frames but never contain a non-zero value is treated as denial. At that point
 it releases every tap, restores normal system audio, and switches the panel to a
 warning with **Open System Settings** and **Retry** buttons.
@@ -79,6 +79,19 @@ warning with **Open System Settings** and **Retry** buttons.
 This matters beyond the UI: a tap mutes the app it reads (`CATapMuteBehavior
 .mutedWhenTapped`), so taps that deliver silence without permission would leave
 apps silent. Releasing them is what restores audio.
+
+Because a denial is discovered *by* silencing something, detection has a cost, so
+it is paid once rather than every launch:
+
+- Detection takes three seconds, not five. The threshold is a measure of how long
+  the user hears nothing, not of how sure the app is.
+- A denial is latched. Once known, no further tap is opened until **Retry**, so an
+  app that starts playing later is never muted behind the app's back.
+- A denial is recorded in `UserDefaults`. The next launch opens no taps at all and
+  goes straight to the banner, because re-deriving the same answer would silence
+  whatever happened to be playing.
+- Any tap that is silent is released, whatever the current state is. Holding one
+  would leave that app muted with nothing in its place.
 
 ## How it works
 
