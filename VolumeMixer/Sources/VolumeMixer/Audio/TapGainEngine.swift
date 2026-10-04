@@ -66,6 +66,14 @@ final class TapChannel {
     /// be sitting on a silent app, in which case no audio flows but nothing is
     /// wrong either.
     let isUnderMixerControl = AtomicFlag()
+    /// Mix cycles that could not be filled from the ring. Any non-zero value
+    /// means the mixer is failing to keep up with the tap and the app this
+    /// channel is muting has holes in its output.
+    let starveCount = FrameCounter()
+    /// Low-water mark of the ring, in frames. The distance between this and a
+    /// full ring is the app's buffer cushion; seeing it near zero is the direct
+    /// evidence of an underrun.
+    let minBuffered = AtomicRate()
     /// Frames copied out of the tap and into the ring, for the same reason.
     let framesCounter = FrameCounter()
     var framesCopied: Int64 { framesCounter.value }
@@ -98,6 +106,8 @@ final class TapChannel {
         description.muteBehavior = muting ? .mutedWhenTapped : .unmuted
         isMuting = muting
         isUnderMixerControl.value = muting
+        minBuffered.value = Double.greatestFiniteMagnitude
+        starveCount.value = 0
 
         var newTapID: AudioObjectID = kAudioObjectUnknown
         let tapStatus = AudioHardwareCreateProcessTap(description, &newTapID)
@@ -620,7 +630,20 @@ final class TapGainEngine: GainEngine {
             _ = AudioDeviceDestroyIOProcID(outputDevice, proc)
             mixerProcID = nil
         }
-        if wasRunning { Log.lifecycle("mixer stopped") }
+        if wasRunning {
+            // Dump per-channel buffer health on shutdown. This is the only
+            // place that can report it safely: the audio thread cannot log, and
+            // by the time anyone is asking why the audio was wrong the cycles
+            // that caused it are long gone.
+            for channel in channels.values where channel.isUnderMixerControl.value {
+                let starved = channel.starveCount.value
+                let low = channel.minBuffered.value
+                Log.lifecycle(String(
+                    format: "channel %@: starved %lld cycle(s), low-water %.0f frames",
+                    channel.appID, starved, low))
+            }
+            Log.lifecycle("mixer stopped")
+        }
         outputDevice = kAudioObjectUnknown
         lastMixerCycle = mixerCycles.value
     }
@@ -747,8 +770,16 @@ final class TapGainEngine: GainEngine {
         // Returning early on a short read -- which is what this used to do --
         // threw away the good part of every underrun, turning a momentary
         // shortfall into a hole in the middle of the music.
+        let buffered = channel.ring.availableFrames
         let complete = channel.ring.readSteady(into: scratch, frameCount: frames,
                                          rateRatio: ratio)
+        if !complete { channel.starveCount.increment() }
+        // Track the worst cushion seen without ever raising it again: a plain
+        // `min` on the audio thread would be a read-modify-write, so the
+        // comparison is done here and only lowered values are stored.
+        if Double(buffered) < channel.minBuffered.value {
+            channel.minBuffered.value = Double(buffered)
+        }
 
         let mixed = scaleInPlace(scratch, count: sampleCount, gain: channel.gain.value)
         // A complete cycle reports its own level. A short one reports a decaying
