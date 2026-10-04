@@ -131,6 +131,35 @@ that way: anything that can read a private key can sign as you, so the export
 that `setup-signing.sh` suggests for backup is a password-protected file you keep
 off the machine it came from.
 
+### Installing on another Mac
+
+```sh
+./Scripts/install.sh
+```
+
+The bundle is built for both architectures (`x86_64` and `arm64`), so one copy
+runs on Apple silicon and Intel alike. `install.sh` copies it to `/Applications`
+(or `~/Applications` without write access), strips the quarantine flag that
+arrives with anything downloaded, and then refuses to call it a success unless
+the bundle has this Mac's CPU in it and the signature verifies here.
+
+Two things survive that copy, and neither is a bug in the app:
+
+**Trust.** A Development certificate is trusted only on the Macs where it is
+installed. On another Mac, expect either "cannot be opened because the developer
+cannot be verified" — right-click the app and choose Open once — or a refusal to
+launch at all, fixed by installing the certificate into that Mac's keychain. For
+distribution to Macs you do not control, the answer is Developer ID signing plus
+notarisation, which needs a paid Apple Developer account; the bundle is already
+built with the hardened runtime that notarisation requires, so signing it with a
+Developer ID identity is the only remaining step.
+
+**Permission.** Screen & System Audio Recording is granted per Mac and per user,
+by hand, in System Settings > Privacy & Security. No installer can do it, and no
+amount of correct signing substitutes for it. Until it is granted the taps come
+up empty and every control does nothing, which looks exactly like a broken app
+and is the single most common way this goes wrong.
+
 ## How it works
 
 ```

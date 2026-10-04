@@ -14,12 +14,40 @@ APP="$ROOT/build/VolumeMixer.app"
 # Uses whatever toolchain swift build resolves (Command Line Tools is enough --
 # we only need the SDK headers and ad-hoc codesign, not xcodebuild).
 
-echo "==> swift build -c $CONFIG"
 cd "$ROOT"
-swift build -c "$CONFIG"
 
-BIN="$(swift build -c "$CONFIG" --show-bin-path)/VolumeMixer"
-[ -f "$BIN" ] || { echo "!! binary not found at $BIN"; exit 1; }
+# Built as one fat binary covering both Mac architectures, because the bundle
+# gets copied to other machines and a single-architecture build simply will not
+# launch on the other kind of Mac.
+#
+# The two slices are built separately rather than with `swift build --arch arm64
+# --arch x86_64`, because the multi-architecture form is implemented in xcbuild,
+# which ships with Xcode and not with the Command Line Tools. Building each and
+# joining them needs neither.
+ARCHS="${ARCHS:-arm64 x86_64}"
+SLICES=()
+FAILED=""
+for arch in $ARCHS; do
+    echo "==> swift build -c $CONFIG --arch $arch"
+    if swift build -c "$CONFIG" --arch "$arch"; then
+        slice="$(swift build -c "$CONFIG" --arch "$arch" --show-bin-path)/VolumeMixer"
+        [ -f "$slice" ] && SLICES+=("$slice") || FAILED="$FAILED $arch"
+    else
+        FAILED="$FAILED $arch"
+    fi
+done
+
+[ ${#SLICES[@]} -gt 0 ] || { echo "!! no architecture built successfully$FAILED" >&2; exit 1; }
+[ -n "$FAILED" ] && echo "!! skipped architecture(s):$FAILED" >&2
+
+BIN="$ROOT/build/.VolumeMixer-universal"
+mkdir -p "$(dirname "$BIN")"
+if [ ${#SLICES[@]} -eq 1 ]; then
+    cp "${SLICES[0]}" "$BIN"
+else
+    lipo -create "${SLICES[@]}" -output "$BIN"
+fi
+echo "==> architectures: $(lipo -archs "$BIN")"
 
 echo "==> assembling $APP"
 rm -rf "$APP"
@@ -43,6 +71,7 @@ for item in "${resources[@]}"; do
     cp -R "$item" "$APP/Contents/Resources/"
 done
 rmdir "$APP/Contents/Resources" 2>/dev/null || true
+rm -f "$BIN"
 
 # Verify the privacy key actually made it into the compiled bundle. TCC denial is
 # silent, so a missing key here is the single most important thing to catch.
@@ -68,7 +97,11 @@ if [ -n "$SIGN_IDENTITY" ]; then
     # private key, and has no way to ask -- a non-interactive session, a script,
     # an IDE build. Granting that trust once turns this into a silent success.
     sign_err="$(mktemp)"
-    if ! codesign --force --sign "$SIGN_IDENTITY" --timestamp=none "$APP" 2>"$sign_err"; then
+    # --options runtime is the hardened runtime. Nothing needs it for a local
+    # build, but notarisation refuses to accept a bundle without it, and
+    # notarisation is what lets this run on a Mac that does not already know the
+    # signing certificate.
+    if ! codesign --force --options runtime --sign "$SIGN_IDENTITY" --timestamp=none "$APP" 2>"$sign_err"; then
         sed 's/^/    /' "$sign_err"
         echo "!! FATAL: could not sign with $SIGN_IDENTITY." >&2
         if grep -q errSecInternalComponent "$sign_err"; then
