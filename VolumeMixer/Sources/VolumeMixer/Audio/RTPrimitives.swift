@@ -238,9 +238,18 @@ final class SampleRingBuffer {
         let read = readStorage.pointee
         let free = capacity - Int(write &- read)
 
+        // Overwrite: advance the read cursor so only the newest `capacity`
+        // frames remain, then treat the whole write as fitting.
+        //
+        // Advancing the consumer's index from the producer side looks alarming,
+        // but the alternative is worse. When the consumer cannot keep up, either
+        // choice loses audio; discarding the oldest frames keeps the freshest
+        // audio and leaves the ring full, which the consumer's level
+        // regulation then drains back down to target. Clamping the write to the
+        // free space instead would leave the ring permanently full and let it
+        // never recover, because the producer would only ever contribute the
+        // frames that happened to fit.
         if free < frameCount {
-            // Overwrite: advance the read cursor so only the newest `capacity`
-            // frames remain, then treat the whole write as fitting.
             readStorage.pointee = write &+ Int64(frameCount) &- Int64(capacity)
         }
 
@@ -361,6 +370,153 @@ final class SampleRingBuffer {
 
             // Advance by whole input frames, carrying the remainder.
             let total = phase + ratio
+            let advance = Int(total)
+            readStorage.pointee &+= Int64(advance)
+            readPhase.pointee = total - Double(advance)
+        }
+        return true
+    }
+
+    /// Measures how many input frames the producer delivers per frame the
+    /// consumer drains, over a window, and returns the true ratio.
+    ///
+    /// This exists because `tapFormat.mSampleRate` cannot be trusted for this.
+    /// It reports 48000 for a tap whose aggregate device is in fact running at
+    /// double that, so dividing one by the other yields exactly 1.0 and every
+    /// rate-based correction built on it is a no-op. The only figure that does
+    /// not lie is the one measured by counting frames on both sides.
+    ///
+    /// Real-time safe: two integer loads and one store, no locks.
+    @inline(__always)
+    func measureRateRatio(produced: Int64, consumed: Int64) -> Double {
+        guard consumed > 0, produced > 0 else { return 1.0 }
+        let ratio = Double(produced) / Double(consumed)
+        // Reported only; not used for steering. Guarded anyway so a transient
+        // miscount cannot produce a nonsense figure in the log.
+        return max(0.25, min(4.0, ratio))
+    }
+
+    /// Drains one mix cycle while regulating the buffer level toward a target.
+    ///
+    /// A fixed one-in-one-out drain is only correct when the producer and the
+    /// consumer run on identical clocks. They do not: the tap is clocked by the
+    /// aggregate device that contains only that tap, while the mixer is clocked
+    /// by the output device. The mismatch is tiny per cycle and cumulative over
+    /// time, so the level walks steadily away from where it started. If the tap
+    /// is even slightly fast the ring fills, the write path starts overwriting
+    /// the oldest audio, and the re-injected sound arrives hundreds of
+    /// milliseconds late -- audible as a hollow, phasey copy of the original
+    /// rather than as a clean repeat of it.
+    ///
+    /// Rather than guess a rate, this steers on the error itself: each output
+    /// frame consumes a little more or a little less input to pull the level
+    /// back toward `targetFrames`. That converges for any clock mismatch,
+    /// including ones the two reported sample rates do not describe, and it caps
+    /// how far the correction can stray so the resampling stays inaudible.
+    ///
+    /// Returns false when the ring ran dry part-way through the cycle, in which
+    /// case the tail has been filled with silence and the prefix holds real
+    /// audio.
+    func readRegulated(into out: UnsafeMutablePointer<Float>,
+                       frameCount: Int,
+                       rateRatio: Double,
+                       targetFrames: Int) -> Bool {
+        guard frameCount > 0 else { return true }
+        let ratio = max(0.25, min(4.0, rateRatio))
+        // How quickly correction strength ramps with the size of the error. At
+        // 1/2000 a 2000-frame error is already ~63% of full correction, so a
+        // large backlog is drained decisively while a small one is corrected
+        // gently.
+        let correctionPerFrame = 1.0 / 2_000.0
+        // Ceiling on the correction, as a multiplier on the base rate.
+        //
+        // Needs to exceed 1.0 because the surplus being corrected is not a small
+        // clock skew: this tap delivers about twice the audio the mixer consumes,
+        // so a ceiling of 1.0 -- consume at most 2x -- leaves the ring
+        // permanently full. The ceiling is what lets the reader match a
+        // genuinely doubled producer instead of only trimming a slow drift.
+        let maxCorrection = 3.0
+        // Frames of error tolerated before correcting. Sized to cover ordinary
+        // callback jitter so a healthy pipeline is left completely alone.
+        let deadbandFrames = max(64, targetFrames / 8)
+
+        for produced in 0..<frameCount {
+            let availableNow = Int(writeStorage.pointee &- readStorage.pointee)
+            guard availableNow > 0 else {
+                for index in (produced * 2)..<(frameCount * 2) {
+                    out[index] = 0
+                }
+                readPhase.pointee = 0
+                return false
+            }
+
+            let base = Int(readStorage.pointee) & mask
+            let next = (base + 1) & mask
+            let phase = readPhase.pointee
+
+            let l0 = storage[base * 2]
+            let r0 = storage[base * 2 + 1]
+            let hasNext = availableNow > 1
+            let l1 = hasNext ? storage[next * 2] : l0
+            let r1 = hasNext ? storage[next * 2 + 1] : r0
+
+            out[produced * 2] = Float(Double(l0) + (Double(l1) - Double(l0)) * phase)
+            out[produced * 2 + 1] = Float(Double(r0) + (Double(r1) - Double(r0)) * phase)
+
+            // Steer the level: too much buffered means consume faster to drain
+            // it, too little means ease off so the tap can catch up.
+            //
+            // Nothing happens while the level is already close to target. That is
+            // deliberate: in the steady state -- which is the overwhelmingly
+            // common case -- the reader consumes exactly one input frame per
+            // output frame and the samples reaching the mixer are the samples
+            // that came out of the tap, bit for bit. Resampling even by a
+            // fraction of a percent would quietly alter every app's audio and
+            // break the promise that unity gain is a pass-through, so the
+            // correction only engages once there is a real error to correct.
+            // Only an *overfull* ring is corrected.
+            //
+            // Too much buffered is the failure that actually occurs: the tap runs
+            // slightly fast, the level climbs, and eventually the write path
+            // starts discarding audio. Too little is a different problem with a
+            // different and better remedy -- a short read is already reported to
+            // the caller, which fills the gap with silence, and the tap refills
+            // the ring on its own within a cycle or two.
+            //
+            // Restricting the correction to one direction is also what keeps
+            // unity gain an exact pass-through. With nothing to drain, the reader
+            // consumes precisely one input frame per output frame and the samples
+            // arriving at the mixer are the samples that left the tap, which is
+            // the property the gain tests exist to protect.
+            // Correction strength ramps with how far off target the ring is.
+            //
+            // A fixed small percentage cannot recover from a large backlog: the
+            // tap keeps filling the ring at exactly the rate the mixer drains it,
+            // so a 2% edge only ever holds the level where it is and the ring
+            // stays full. The correction therefore grows with the error and is
+            // allowed to reach 100% -- consuming two input frames for one output
+            // frame -- while far from target, then falls away to nothing as the
+            // level approaches it. Draining faster than real time is audible
+            // only in proportion to how much audio is discarded, and the audio
+            // being discarded is audio the user is already ~0.7 s behind on, so
+            // dropping it is strictly better than continuing to play it late.
+            //
+            // The ramp is squared rather than linear so that correction strength
+            // collapses as the level nears target. A linear ramp still applies
+            // most of its strength right up to the target and sails past it,
+            // which trades a full ring for an empty one. Squaring makes the
+            // approach asymptotic: the last few hundred frames are corrected
+            // gently enough to land on target instead of overshooting.
+            let excess = Double(availableNow - targetFrames - deadbandFrames)
+            let steered: Double
+            if excess <= 0 {
+                steered = ratio
+            } else {
+                let ramped = 1.0 - exp(-excess * correctionPerFrame)
+                let strength = ramped * ramped * maxCorrection
+                steered = ratio * (1.0 + strength)
+            }
+            let total = phase + steered
             let advance = Int(total)
             readStorage.pointee &+= Int64(advance)
             readPhase.pointee = total - Double(advance)

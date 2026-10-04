@@ -713,4 +713,66 @@ struct ReadSteadyTests {
         #expect(out[12] == 0)
         #expect(out[14] == 0)
     }
+    @Test("an overfull ring is drained toward the target")
+    func regulatedDrainsOverfullRing() {
+        // The failure this exists for: with a fixed one-in-one-out drain and a tap
+        // that is even slightly fast, the level climbs until the ring is full and
+        // the write path starts overwriting audio. The re-injected sound then
+        // arrives hundreds of milliseconds late, which is heard as a hollow,
+        // phasey copy rather than the original.
+        let ring = SampleRingBuffer(capacity: 4096)
+        let target = 1024
+        fill(ring, frames: 4000, from: 1)
+        #expect(ring.availableFrames > target, "precondition: the ring starts overfull")
+
+        // A producer that keeps refilling, mirroring the real case: the tap
+        // delivers about twice what the mixer drains, so a reader that cannot
+        // outrun that surplus holds its backlog forever. This is what the
+        // ceiling on the correction exists for.
+        var scratch = [Float](repeating: 0, count: 256 * 2)
+        var level = ring.availableFrames
+        for _ in 0..<40 {
+            let refill = 512
+            var input = [Float](repeating: 1, count: refill * 2)
+            input.withUnsafeBufferPointer { ring.write($0.baseAddress!, frameCount: refill) }
+            scratch.withUnsafeMutableBufferPointer {
+                _ = ring.readRegulated(into: $0.baseAddress!, frameCount: 256,
+                                       rateRatio: 1.0, targetFrames: target)
+            }
+            level = ring.availableFrames
+        }
+
+        // The requirement is that the backlog stops being held: with a producer
+        // running, an unbounded backlog is the failure and it cannot recover on
+        // its own. Converging near target is what that looks like.
+        #expect(level < 4000, "the ring must not stay at its original backlog")
+        // Not the target exactly: with a producer at 2x, the reader converges to
+        // wherever the correction's ceiling balances the surplus, and that
+        // balance point is a small multiple of the target rather than the target
+        // itself. What matters is that it is bounded and small -- tens of
+        // milliseconds of latency -- instead of the ring's full 4000 frames.
+        #expect(level <= target * 3,
+                "and must settle at a bounded multiple of the target, not hold the backlog")
+    }
+
+    @Test("regulation leaves a ring that is already on target alone")
+    func regulatedIsTransparentNearTarget() {
+        // Unity gain has to be an exact pass-through in the steady state, or the
+        // mixer is quietly altering every app's audio even when the slider is at
+        // 100%. With the level on target the reader must consume exactly one
+        // input frame per output frame.
+        let ring = SampleRingBuffer(capacity: 4096)
+        let target = 1024
+        fill(ring, frames: target + 64, from: 1)
+
+        var out = [Float](repeating: 0, count: 32 * 2)
+        let complete = out.withUnsafeMutableBufferPointer {
+            ring.readRegulated(into: $0.baseAddress!, frameCount: 32,
+                               rateRatio: 1.0, targetFrames: target)
+        }
+
+        #expect(complete)
+        #expect(out[0] == 1, "the first input frame must come through untouched")
+        #expect(out[2] == 2, "and the second, with no resampling in between")
+    }
 }

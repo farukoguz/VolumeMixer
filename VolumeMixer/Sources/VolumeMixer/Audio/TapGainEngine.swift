@@ -70,6 +70,11 @@ final class TapChannel {
     /// means the mixer is failing to keep up with the tap and the app this
     /// channel is muting has holes in its output.
     let starveCount = FrameCounter()
+    /// Frames the mixer has taken out of the ring. Compared against
+    /// `framesCopied` to measure whether the tap really is delivering more audio
+    /// than the mixer consumes, which is the difference between "the reader is
+    /// not draining hard enough" and "the clocks do not match".
+    let framesConsumed = FrameCounter()
     /// Low-water mark of the ring, in frames. The distance between this and a
     /// full ring is the app's buffer cushion; seeing it near zero is the direct
     /// evidence of an underrun.
@@ -110,6 +115,7 @@ final class TapChannel {
         // initial sentinel of "infinity" prints as garbage in the health log.
         minBuffered.value = 0
         starveCount.value = 0
+        framesConsumed.value = 0
 
         var newTapID: AudioObjectID = kAudioObjectUnknown
         let tapStatus = AudioHardwareCreateProcessTap(description, &newTapID)
@@ -381,6 +387,14 @@ final class TapGainEngine: GainEngine {
         // is created only while there is at least one app to route.
         startWatchdog()
     }
+
+    /// Level the reader steers the ring back toward, in frames.
+    ///
+    /// Small on purpose. This is the latency the mixer adds to every tapped app,
+    /// so it is also the delay between those apps and everything else on the
+    /// system: 20 ms is enough to absorb a jittery callback without being
+    /// perceptible as the app being out of time with the rest of the desktop.
+    static let targetBufferFrames = 1024
 
     // MARK: - GainEngine
 
@@ -771,11 +785,22 @@ final class TapGainEngine: GainEngine {
                     limit: Int,
                     peakDecay: Float,
                     outputRate: Double = 0) {
-        // Input frames consumed per output frame. Exactly 1.0 when the tap and
-        // the output device agree, which is the common case; the small deviation
-        // is real and is what caused the stutter.
-        let tapRate = channel.tapSampleRate.value
-        let ratio = tapRate > 0 && outputRate > 0 ? tapRate / outputRate : 1.0
+        // Input frames to consume per output frame.
+        //
+        // Not derived from the reported sample rates. `tapFormat.mSampleRate`
+        // reads 48000 Hz while the tap's aggregate device actually delivers
+        // roughly 96000, so the ratio computed from the two rates comes out as
+        // exactly 1.0 and no correction is ever applied -- which is why an
+        // earlier version of this correction appeared to do nothing.
+        //
+        // What actually holds the level is the buffer itself: the level is a
+        // direct measure of the surplus, and steering on it needs no knowledge of
+        // either clock. The measured production/consumption ratio is logged so
+        // the relationship stays visible instead of being inferred.
+        let measured = channel.ring.measureRateRatio(produced: channel.framesCopied,
+                                                     consumed: channel.framesConsumed.value)
+        _ = measured
+        let ratio = 1.0
 
         // Always sum the cycle. This tap has its app muted, so whatever the reader
         // did not fill is silence that would otherwise not be heard at all, and
@@ -784,8 +809,15 @@ final class TapGainEngine: GainEngine {
         // threw away the good part of every underrun, turning a momentary
         // shortfall into a hole in the middle of the music.
         let buffered = channel.ring.availableFrames
-        let complete = channel.ring.readSteady(into: scratch, frameCount: frames,
-                                         rateRatio: ratio)
+        // Regulate toward a target level rather than draining a fixed one frame
+        // per frame. The two clocks differ slightly and always will, so a fixed
+        // drain walks the level away until the ring is full and the write path
+        // starts overwriting audio -- which is heard as the app's sound arriving
+        // hundreds of milliseconds late and phasey against everything else.
+        let complete = channel.ring.readRegulated(into: scratch, frameCount: frames,
+                                                  rateRatio: ratio,
+                                                  targetFrames: Self.targetBufferFrames)
+        channel.framesConsumed.increment(by: Int64(frames))
         if !complete { channel.starveCount.increment() }
         // Track the worst cushion seen without ever raising it again: a plain
         // `min` on the audio thread would be a read-modify-write, so the
@@ -942,11 +974,21 @@ final class TapGainEngine: GainEngine {
         lastHealthReport = now
         for channel in channels.values {
             let role = channel.isUnderMixerControl.value ? "muting" : "probe"
+            // `net` is the diagnostic that matters: frames arriving from the tap
+            // per frame the mixer consumes. Anything persistently above 1.0 is
+            // surplus audio that has nowhere to go, and since the reader is
+            // already correcting hard, a sustained surplus means the two are not
+            // actually running at the same rate and the reported sample rates are
+            // not describing the real relationship between the clocks.
+            let net = channel.framesCopied > 0
+                ? Double(channel.framesCopied) / Double(max(1, channel.framesConsumed.value))
+                : 0
             Log.lifecycle(String(
-                format: "health %@ [%@]: starved %lld cycle(s), low-water %.0f frames, buffered %d, tapRate %.1f Hz",
+                format: "health %@ [%@]: starved %lld, low %.0f, buffered %d, tap %.0f Hz, copied %lld consumed %lld, ratio %.5f",
                 channel.appID, role, channel.starveCount.value,
                 channel.minBuffered.value, channel.ring.availableFrames,
-                channel.tapSampleRate.value))
+                channel.tapSampleRate.value,
+                channel.framesCopied, channel.framesConsumed.value, net))
         }
     }
 
