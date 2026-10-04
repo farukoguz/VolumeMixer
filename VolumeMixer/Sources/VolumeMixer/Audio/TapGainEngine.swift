@@ -215,6 +215,12 @@ final class TapChannel {
     func promoteToMuting() {
         guard !isMuting, tapID != kAudioObjectUnknown else { return }
         let queue = renderQueue
+        // Promote only with the ring already holding a real cushion. Without this
+        // the tap starts muting while its replacement buffer is still nearly
+        // empty, so the first cycles after promotion starve and the app is
+        // briefly silent even though capture works perfectly. A fraction of a
+        // second of latency in exchange for never starting mid-hole.
+        guard ring.availableFrames >= Self.primingFrames else { return }
         stop()
         guard let queue else { return }
         let status = start(queue: queue, muting: true)
@@ -223,6 +229,11 @@ final class TapChannel {
             isMuting = false
         }
     }
+
+    /// Frames the ring must hold before a probe may start muting. Roughly 40 ms
+    /// at 48 kHz: long enough that the mixer has a cushion to absorb a late
+    /// cycle, short enough to be inaudible as added latency.
+    private static let primingFrames = 2048
 
     func stop() {
         if let ioProc = ioProcID {
@@ -308,6 +319,11 @@ final class TapGainEngine: GainEngine {
     private var silentTicks = 0
     /// Watchdog ticks of a silent tap before it is released. Each tick is a
     /// second, and each is also a second the user cannot hear that app.
+    /// Watchdog ticks needed before silence is called a denied permission. The
+    /// tick is now 100 ms, so three ticks is 300 ms rather than three seconds.
+    /// Cutting the detection window was previously unsafe because a muted tap
+    /// made every tick cost the user silence; probes do not mute, so detecting
+    /// the refusal fast costs nothing and keeps a broken tap from lingering.
     private static let denialTicks = 3
     /// How long a freshly started mixer is given to produce its first cycle.
     private let mixerStartupGrace: TimeInterval = 3
@@ -320,7 +336,11 @@ final class TapGainEngine: GainEngine {
     /// attaches impossible: a tap created after the watchdog is gone would mute
     /// an app with no way left to release it.
     private var isShutDown = false
-    private let watchdogInterval: TimeInterval = 1.0
+    /// 100 ms. The watchdog only promotes probes and tears down denied taps, and
+    /// a probe that has not been promoted yet is not muting anything, so acting
+    /// on this timescale is harmless. At 1 s, priming took a second to notice
+    /// and gain control arrived visibly late after launch.
+    private let watchdogInterval: TimeInterval = 0.1
 
     /// The level the user chose per app, held separately from mute so that
     /// unmuting restores what was there before. Kept here rather than in the UI
@@ -721,22 +741,25 @@ final class TapGainEngine: GainEngine {
         let tapRate = channel.tapSampleRate.value
         let ratio = tapRate > 0 && outputRate > 0 ? tapRate / outputRate : 1.0
 
-        guard channel.ring.readSteady(into: scratch, frameCount: frames,
-                                      rateRatio: ratio) else {
-            // Starved this cycle. The scratch holds a fade-out, not real audio,
-            // so it must not be metered or summed as if it were.
-            _ = scaleInPlace(scratch, count: sampleCount, gain: channel.gain.value)
-            return
-        }
+        // Always sum the cycle. This tap has its app muted, so whatever the reader
+        // did not fill is silence that would otherwise not be heard at all, and
+        // the real prefix must not be discarded just because the tail was short.
+        // Returning early on a short read -- which is what this used to do --
+        // threw away the good part of every underrun, turning a momentary
+        // shortfall into a hole in the middle of the music.
+        let complete = channel.ring.readSteady(into: scratch, frameCount: frames,
+                                         rateRatio: ratio)
 
         let mixed = scaleInPlace(scratch, count: sampleCount, gain: channel.gain.value)
-        // Decay instead of latching, otherwise a meter pins at the last
-        // non-zero peak for as long as the app stays routed.
-        channel.peak.value = max(mixed, channel.peak.value * peakDecay)
+        // A complete cycle reports its own level. A short one reports a decaying
+        // value instead, because the silence the reader wrote is not the app
+        // going quiet and metering it as such would make the level jump around
+        // during a dropout.
+        channel.peak.value = complete
+            ? max(mixed, channel.peak.value * peakDecay)
+            : channel.peak.value * peakDecay
 
         if deinterleaved {
-            // readSteady either fills every frame or returns having faded the
-            // shortfall to silence, so `frames` is the honest count either way.
             accumulatePlanar(scratch, frames: frames, left: destination, right: right)
         } else {
             accumulateInterleaved(scratch, count: sampleCount, into: destination,

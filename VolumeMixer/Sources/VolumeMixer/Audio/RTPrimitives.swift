@@ -325,10 +325,15 @@ final class SampleRingBuffer {
         for produced in 0..<frameCount {
             let availableNow = Int(writeStorage.pointee &- readStorage.pointee)
             guard availableNow > 0 else {
-                // Nothing buffered, so there is no partial frame to fade out
-                // from: the cycle's tail is silence. Assign rather than scale so
-                // this does not depend on the caller having cleared the buffer,
-                // and the mixer can treat a false return as "nothing usable".
+                // The input ran dry part-way through this cycle. Everything up to
+                // here is real audio and has already been written, so it must not
+                // be thrown away: the caller is about to replace a *muted* app,
+                // and discarding a good cycle here is an audible dropout in the
+                // middle of a song. Only the remaining tail is silence.
+                //
+                // Repeating the final real sample for the tail rather than zeroing
+                // would hold the waveform, which on a music signal is far more
+                // audible than a gap, so the tail is genuinely silent.
                 for index in (produced * 2)..<(frameCount * 2) {
                     out[index] = 0
                 }

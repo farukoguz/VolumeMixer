@@ -687,4 +687,30 @@ struct ReadSteadyTests {
         }
         #expect(out[0] == 1, "a reset ring must start from its first frame")
     }
+    @Test("a short cycle still delivers the frames it does have")
+    func shortCycleKeepsItsPrefix() {
+        // The regression that made a song sound chopped: a starved cycle used to
+        // discard everything, including the real audio at the front of the
+        // buffer. With the app muted and the mixer responsible for replacing its
+        // sound, throwing that away is an audible hole.
+        let ring = SampleRingBuffer(capacity: 4096)
+        fill(ring, frames: 5, from: 1)
+
+        var out = [Float](repeating: 0, count: 8 * 2)
+        let complete = out.withUnsafeMutableBufferPointer {
+            ring.readSteady(into: $0.baseAddress!, frameCount: 8, rateRatio: 1.0)
+        }
+
+        #expect(!complete, "5 buffered frames cannot fill a request for 8")
+        // The five frames that did exist are real audio (values 1...5) and must
+        // survive; the remaining three are the silence the reader had to invent.
+        #expect(out[0] == 1)
+        #expect(out[2] == 2)
+        #expect(out[4] == 3)
+        #expect(out[6] == 4)
+        #expect(out[8] == 5, "the fifth buffered frame is still real audio")
+        #expect(out[10] == 0, "the unfilled tail must be silent, not held")
+        #expect(out[12] == 0)
+        #expect(out[14] == 0)
+    }
 }
