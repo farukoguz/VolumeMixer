@@ -8,8 +8,29 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-CONFIG="${1:-release}"
 APP="$ROOT/build/VolumeMixer.app"
+
+# Arguments are parsed before anything uses CONFIG. Doing this further down looks
+# tidier but is wrong: the build loop below runs first and would be handed
+# "--ad-hoc" as a configuration name.
+#
+#   --ad-hoc   sign ad-hoc, ignoring any certificate in the keychain
+#   <name>     build configuration, defaulting to release
+SIGN_AD_HOC=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --ad-hoc) SIGN_AD_HOC=1 ;;
+        -h|--help)
+            sed -n '2,7p' "$0" | sed 's/^#\{1,1\} \{0,1\}//'
+            echo
+            echo "Usage: $0 [--ad-hoc] [configuration]"
+            exit 0
+            ;;
+        *) break ;;
+    esac
+    shift
+done
+CONFIG="${1:-release}"
 
 # Uses whatever toolchain swift build resolves (Command Line Tools is enough --
 # we only need the SDK headers and ad-hoc codesign, not xcodebuild).
@@ -90,13 +111,34 @@ for key in NSScreenCaptureUsageDescription NSAudioCaptureUsageDescription; do
     echo "    $key present OK"
 done
 
-# Prefer a real signing identity, because macOS will not grant Screen & System
-# Audio Recording to an ad-hoc build: taps are created, every buffer is zero, and
-# nothing anywhere reports a refusal. An app with no Team ID is anonymous as far
-# as TCC is concerned, so there is nothing for the user to grant it in.
-SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
-    | grep -E '"(Apple Development|Developer ID Application|Mac App Distribution)' \
-    | head -1 | sed -E 's/^[^"]*"(.*)"$/\1/')"
+# Which identity to sign with, in order of preference.
+#
+#   SIGN_IDENTITY=...  sign with exactly this identity
+#   SIGN_AD_HOC=1      sign ad-hoc, ignoring any certificate in the keychain
+#   (unset)            use the first codesigning identity found
+#
+# A real certificate is preferred, and a Development one is enough for a build
+# that will only ever run on the machine that made it. Neither kind helps on
+# somebody else's Mac: Gatekeeper refuses an Apple Development signature
+# outright, so a user must right-click and choose Open once, every time.
+#
+# Ad-hoc is not a fallback that "loses" permissions -- it is genuinely
+# grantable. The cost is subtler and worth stating plainly: macOS records a TCC
+# grant against the exact code it saw, so the grant does not survive a rebuild.
+# Change one byte, and the user's screen-recording permission has to be given
+# again. That is fine for someone iterating on the build, and miserable for
+# someone handed a download, which is why signing still wins by default.
+#
+# `--ad-hoc` is provided for the case that matters most: a contributor with no
+# certificate at all. Without it such a build still works locally, but only by
+# accident of the keychain happening to hold something usable.
+if [ -n "${SIGN_AD_HOC:-}" ]; then
+    SIGN_IDENTITY=""
+else
+    SIGN_IDENTITY="${SIGN_IDENTITY:-$(security find-identity -v -p codesigning 2>/dev/null \
+        | grep -E '"(Apple Development|Developer ID Application|Mac App Distribution)' \
+        | head -1 | sed -E 's/^[^"]*"(.*)"$/\1/')}"
+fi
 
 if [ -n "$SIGN_IDENTITY" ]; then
     echo "==> codesigning ($SIGN_IDENTITY)"
@@ -123,9 +165,10 @@ if [ -n "$SIGN_IDENTITY" ]; then
     fi
     rm -f "$sign_err"
 else
-    echo "==> codesigning (ad-hoc, no identity found)"
-    echo "    !! Screen & System Audio Recording cannot be granted to this build."
-    echo "    !! Add a signing identity, or gain will stay unverifiable."
+    echo "==> codesigning (ad-hoc)"
+    echo "    Screen & System Audio Recording can be granted to this build."
+    echo "    The grant is tied to this exact code, so a rebuild means granting it"
+    echo "    again. Gatekeeper will also require right-click > Open the first time."
     codesign --force --sign - --timestamp=none "$APP" 2>&1 | sed 's/^/    /'
 fi
 codesign --verify --verbose=1 "$APP" 2>&1 | sed 's/^/    /'

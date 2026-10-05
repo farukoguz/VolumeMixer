@@ -62,8 +62,7 @@ echo "    architectures:  $(lipo -archs "$APP/Contents/MacOS/VolumeMixer")"
 if [ -n "$TEAM" ]; then
     echo "    signed:         yes, Team $TEAM"
 else
-    echo "    signed:         AD-HOC -- macOS will not grant Screen & System Audio"
-    echo "                    Recording to this build, so gain cannot be measured."
+    echo "    signed:         ad-hoc"
 fi
 
 cat <<EOF
@@ -72,19 +71,32 @@ cat <<EOF
 
 Two things are left, and neither can be done by a script.
 
-1. If macOS refuses to open it ("cannot be opened because the developer cannot
-   be verified"), that Mac does not trust the signing certificate. Either
-   right-click the app and choose Open once, or install the certificate into
-   that Mac's keychain. A Development certificate is only trusted where it is
-   installed, so for anybody else's Mac the real answer is Developer ID
-   signing plus notarisation, which needs a paid Apple Developer account.
+1. FIRST LAUNCH -- macOS refuses to open a build it cannot attribute to a
+   trusted developer:
 
-2. Grant the permission, on this Mac, in System Settings > Privacy & Security >
-   Screen & System Audio Recording. macOS gates it per Mac and per user, so it
-   has to be granted on every machine separately. Without it the app cannot
-   read any audio: the taps come up empty and every slider does nothing, with
-   no error anywhere.
+       "Volume Mixer cannot be opened because the developer cannot be verified"
 
-Then launch it. If the permission alert appears, "Try Again" picks the grant up
+   This is expected, and it is not a problem to fix. Right-click (or
+   Control-click) Volume Mixer in Finder, choose Open, then confirm. macOS
+   remembers that decision for the app, so this is a one-time step per Mac. If
+   the Open button is greyed out, choose "Open anyway" in the same dialog.
+
+   Removing that step entirely needs a Developer ID signature plus Apple
+   notarisation, which requires a paid Apple Developer Program membership.
+
+2. GRANT THE PERMISSION -- System Settings > Privacy & Security > Screen &
+   System Audio Recording, then add Volume Mixer. macOS requires this per Mac
+   and per user, and no installer can do it.
+
+   Without it the app still launches and still lists whatever is playing, but
+   it cannot read any audio: the taps come up empty, every slider does nothing,
+   and no error is shown anywhere. That silence is the entire failure mode, so
+   if a slider does nothing, check this before anything else.
+
+   One wrinkle specific to ad-hoc builds: the grant is tied to that exact build,
+   so a rebuild means granting it again. A signed build's grant survives a
+   rebuild, which is the practical reason to sign once a certificate exists.
+
+Then launch it. If the permission alert appears, "Try Again" picks up the grant
 without a relaunch.
 EOF
