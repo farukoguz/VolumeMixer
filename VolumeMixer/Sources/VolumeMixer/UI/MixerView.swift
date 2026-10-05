@@ -55,7 +55,7 @@ struct AppRowView: View {
                         Text("×\(channel.processCount)")
                             .font(.system(size: 9, weight: .medium))
                             .foregroundStyle(.secondary)
-                            .help("\(channel.processCount) processes, all controlled together")
+                            .help(Self.roleSummary(for: channel))
                     }
 
                     if !channel.live {
@@ -95,6 +95,18 @@ struct AppRowView: View {
             .help(channel.muted ? "Unmute" : "Mute")
         }
         .padding(.vertical, 3)
+    }
+
+    /// Tooltip naming the processes behind the count.
+    ///
+    /// Browsers play audio from helper processes whose own names say nothing
+    /// useful -- "Brave Browser Helper (Plugin)", "Google Chrome Helper
+    /// (Renderer)". Listing them is the only way to answer "why does this row say
+    /// ×3?" without leaving the app.
+    private static func roleSummary(for channel: AppModel.Channel) -> String {
+        let count = "\(channel.processCount) processes, all controlled together"
+        guard !channel.roles.isEmpty else { return count }
+        return count + ":\n" + channel.roles.joined(separator: "\n")
     }
 
     @ViewBuilder

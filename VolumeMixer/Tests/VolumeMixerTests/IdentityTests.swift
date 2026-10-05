@@ -15,7 +15,8 @@ struct AudioAppIdentityTests {
                  processObjectID: 1,
                  pid: pid,
                  displayName: "Test",
-                 icon: nil)
+                 icon: nil,
+                 roleName: nil)
     }
 
     @Test("a bundled app is keyed by bundle ID, which survives relaunch")
@@ -92,7 +93,8 @@ struct GroupingTests {
                  processObjectID: AudioObjectID(pid),
                  pid: pid,
                  displayName: "Test",
-                 icon: nil)
+                 icon: nil,
+                 roleName: nil)
     }
 
     @Test("two instances of one app become one row, not two identical rows")
@@ -120,5 +122,62 @@ struct GroupingTests {
     func keepsOrder() {
         let apps = [app(bundleID: "b.app", pid: 1), app(bundleID: "a.app", pid: 2)]
         #expect(AppModel.groupByApp(apps).map(\.identity) == ["b.app", "a.app"])
+    }
+}
+
+// MARK: - Owning app resolution
+
+@Suite("Helper naming")
+struct OwningAppTests {
+
+    /// The real path from a running Brave helper, which is the case that was
+    /// broken: the innermost `.app` is the helper itself, the outermost is the app
+    /// the user installed.
+    private let braveHelper =
+        "/Applications/Brave Browser.app/Contents/Frameworks/Brave Browser Framework.framework"
+        + "/Versions/143.1.85.111/Helpers/Brave Browser Helper.app/Contents/MacOS/Brave Browser Helper"
+
+    @Test("the owning app is the outermost bundle, not the helper's own")
+    func outermostBundleWins() {
+        let path = AudioApp.owningAppPath(ofExecutable: braveHelper)
+        #expect(path == "/Applications/Brave Browser.app",
+                "must resolve to the installed app, not Brave Browser Helper.app")
+    }
+
+    @Test("a helper's role name comes from its own executable")
+    func helperRoleName() {
+        // The helper is named by its own executable because the owning app's name
+        // is what the row already shows; the role is only the extra detail.
+        let role = AudioApp.cleanedHelperName("Brave Browser Helper (Plugin)")
+        #expect(role == "Brave Browser Helper (Plugin)")
+    }
+
+    @Test("a bare Helper executable does not become a row title")
+    func bareHelperNameIsNotUseful() {
+        // Nothing to distinguish it from any other bare "Helper", so it must not
+        // be the fallback when the bundle cannot be resolved.
+        #expect(AudioApp.cleanedHelperName("Helper") == "Helper")
+    }
+
+    @Test("a command-line player has no owning app")
+    func commandLineHasNoOwner() {
+        #expect(AudioApp.owningAppPath(ofExecutable: "/usr/bin/afplay") == nil,
+                "afplay is not inside any app bundle")
+    }
+
+    @Test("a top-level app resolves to itself")
+    func appResolvesToItself() {
+        let path = AudioApp.owningAppPath(ofExecutable: "/Applications/Safari.app/Contents/MacOS/Safari")
+        #expect(path == "/Applications/Safari.app")
+    }
+
+    @Test("helpers of one app are distinguishable but keep their own identity")
+    func helpersStayDistinct() {
+        // The row merges them, but tapping is per-process, so identity must still
+        // be the helper's own bundle ID rather than the owning app's.
+        let main = AudioApp(bundleID: "com.brave.Browser", executablePath: "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser", processObjectID: 1, pid: 100, displayName: "Brave Browser", icon: nil, roleName: nil)
+        let helper = AudioApp(bundleID: "com.brave.Browser.helper", executablePath: braveHelper, processObjectID: 2, pid: 101, displayName: "Brave Browser", icon: nil, roleName: "Brave Browser Helper")
+        #expect(main.id != helper.id, "a helper must not collide with its app")
+        #expect(main.processKey != helper.processKey)
     }
 }

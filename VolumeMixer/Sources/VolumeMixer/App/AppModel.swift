@@ -15,6 +15,13 @@ final class AppModel: ObservableObject {
         let app: AudioApp
         /// How many processes of this app are playing, all controlled together.
         var processCount: Int
+        /// What the extra processes are, e.g. "Brave Browser Helper (Plugin)".
+        ///
+        /// A browser produces audio from several helper processes. Collapsing them
+        /// into one row is right -- one app, one slider -- but the row then claims
+        /// to control more than the user can see, so the roles are kept to explain
+        /// the count.
+        var roles: [String]
         var gain: Float
         var muted: Bool
         var peak: Float
@@ -305,8 +312,16 @@ final class AppModel: ObservableObject {
             let saved = settings.level(for: id)
             // An in-session change wins over the stored level.
             let existing = channels.first { $0.id == id }
+            // Distinct roles only: several helpers of the same kind add nothing
+            // beyond the count already shown.
+            var roles: [String] = []
+            for process in processes.dropFirst() {
+                guard let role = process.roleName, !roles.contains(role) else { continue }
+                roles.append(role)
+            }
             next.append(Channel(app: app,
                                 processCount: processes.count,
+                                roles: roles,
                                 gain: existing?.gain ?? saved.gain,
                                 muted: existing?.muted ?? saved.muted,
                                 peak: existing?.peak ?? 0,
