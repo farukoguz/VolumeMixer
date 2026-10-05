@@ -35,8 +35,12 @@ else
     echo "    ad-hoc -- recipients must right-click > Open once"
 fi
 
-rm -rf "$OUT"
+# Only this script's own artefacts. Wiping the whole directory used to be safe
+# when it was the only thing writing here; now that make-dmg.sh shares it, doing
+# that would silently delete a DMG someone had already built and was about to
+# upload.
 mkdir -p "$OUT"
+rm -f "$ZIP" "$OUT/READ ME FIRST.txt"
 
 # ditto, not zip: it is the only archiver that reliably preserves the symlinks
 # and extended attributes inside a macOS bundle. A plain `zip` occasionally

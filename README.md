@@ -9,17 +9,24 @@ replaces the *mixing* of app audio, not the device itself.
 
 ## Install
 
-Download **VolumeMixer.app** from the top of this page, then:
+Go to [Releases](https://github.com/farukoguz/VolumeMixer/releases) and download
+**VolumeMixer-1.0.dmg**. Open it, and drag Volume Mixer onto the Applications
+shortcut that appears beside it.
 
-1. **Move it to Applications.** Drag `VolumeMixer.app` onto the `Applications`
-   folder in your Dock, or select it and press `⌘C` then `⌘V`. Dragging it out of
-   the download location matters: leaving it in `Downloads` works, but macOS
-   treats that folder specially and you can end up launching a stale copy after
-   updating.
+You can also download **VolumeMixer.app** from the top of this page if you would
+rather skip the disk image.
 
-   If macOS asks to move it, choose **Applications**. If the folder is not
-   writable — rare on a personal Mac — drag into your user folder instead
-   (`⌘⇧H`, then `Applications`), and it will run from there.
+Either way, then:
+
+1. **Move it to Applications.** From the .dmg, drag Volume Mixer onto the
+   `Applications` shortcut inside the mounted image, then eject the disk. If you
+   downloaded the .app directly, drag it onto the `Applications` folder in your
+   Dock, or select it and press `⌘C` then `⌘V`.
+
+   Dragging it out of `Downloads` matters: leaving it there works, but you can end
+   up launching a stale copy after updating. If the folder is not writable — rare
+   on a personal Mac — drag into your user folder instead (`⌘⇧H`, then
+   `Applications`) and it will run from there.
 
 2. **Open it once by hand.** macOS refuses to launch a build it cannot attribute
    to a trusted developer:
@@ -67,6 +74,31 @@ open build/VolumeMixer.app
 ```
 
 To give a build to someone else, see [Sharing a build](#sharing-a-build).
+
+## Releases
+
+`Scripts/make-dmg.sh` builds `build/dist/VolumeMixer-<version>.dmg`, which is what
+a release page attaches. A .dmg rather than a .zip because the drag onto the
+Applications shortcut *is* the install — a zip makes the user unzip first, which
+puts a folder in front of them and somewhere to make a mistake.
+
+Nothing in the image installs anything by itself, and that is deliberate. A .dmg
+cannot copy the app anywhere on its own, and an app that quietly installed itself
+when double-clicked is the oldest trick there is; Gatekeeper's entire job is
+refusing to run code the user did not choose to run. So the app and an
+`/Applications` symlink sit in a mounted image and the user drags. The script
+automates only the part that otherwise fails silently.
+
+To cut a release:
+
+```sh
+git tag -a v1.0 -m 'Version 1.0' && git push origin v1.0
+# then attach build/dist/VolumeMixer-1.0.dmg on the release page
+```
+
+**A release download carries a quarantine flag**, set by the browser rather than by
+anything in the image, so the first launch still needs a right-click → Open. Only
+notarisation removes that, and it needs a paid Apple Developer membership.
 
 `Scripts/build-app.sh` builds a real `.app` bundle and signs it with the first
 signing identity in the keychain. Pass `--ad-hoc` to sign ad-hoc instead, which is
@@ -450,6 +482,7 @@ Paths are from the repository root, which is also the SwiftPM package root.
 | `Scripts/build-app.sh` | assembles and signs the bundle |
 | `Scripts/install.sh` | installs to /Applications and verifies the copy |
 | `Scripts/package.sh` | zips a build for someone else, with instructions |
+| `Scripts/make-dmg.sh` | builds the .dmg installer a release page serves |
 | `Scripts/setup-signing.sh` | one-time keychain trust for `codesign` |
 | `Scripts/verify-gain.sh` | measures the gain path against real audio |
 | `Scripts/diagnose.sh`, `Scripts/observe.sh` | tap and lifecycle logging |
