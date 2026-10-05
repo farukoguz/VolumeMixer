@@ -106,13 +106,26 @@ fi
 hdiutil detach "$MOUNTED" -quiet
 rm -rf "$MOUNTED"
 
+# Written next to the image and published alongside it. The build is not
+# notarised, so macOS cannot tell a genuine download from a tampered one, and
+# there is no other signal a user can check. The checksum is of the finished
+# image rather than of anything inside it, so it also catches a truncated
+# download -- the most likely way for this file to be wrong in someone's hands.
+# `shasum -a 256 -c` verifies it.
+CHECKSUM_FILE="$(dirname "$DMG")/$(basename "$DMG").sha256"
+( cd "$(dirname "$DMG")" && shasum -a 256 "$(basename "$DMG")" > "$(basename "$CHECKSUM_FILE")" )
+
 echo "==> done"
 echo "    $DMG"
 echo "    $(du -h "$DMG" | cut -f1)"
+echo "    $CHECKSUM_FILE"
+echo "    $(cut -d' ' -f1 < "$CHECKSUM_FILE")"
 echo
-echo "Publish it with:"
+echo "Publish both files, and put the checksum in the release notes:"
 echo "    git tag -a v$VERSION -m 'Version $VERSION'"
 echo "    git push origin v$VERSION"
-echo "    # then attach build/dist/VolumeMixer-$VERSION.dmg to the release on GitHub"
+echo "    gh release create v$VERSION \\"
+echo "        build/dist/$(basename "$DMG") \\"
+echo "        build/dist/$(basename "$CHECKSUM_FILE")"
 
 rm -rf "$STAGE"
