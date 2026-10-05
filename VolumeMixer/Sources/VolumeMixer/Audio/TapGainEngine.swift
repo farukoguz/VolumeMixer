@@ -60,6 +60,9 @@ final class TapChannel {
     /// coarse. A lowpass ahead of the decimation is what keeps it clean.
     let decimationFilter = DecimationFilter()
 
+    /// Stream format the tap delivered, kept for diagnostics only.
+    private var tapFormat = AudioStreamBasicDescription()
+
     /// The tap's sample rate, captured at start-up. The mixer runs on the output
     /// device's clock, which is a different clock, so this ratio is what lets the
     /// reader reconcile the two instead of falling behind by a frame each cycle.
@@ -142,17 +145,18 @@ final class TapChannel {
             kAudioAggregateDeviceUIDKey: "com.volumemixer.tap.\(UUID().uuidString)",
             kAudioAggregateDeviceIsPrivateKey: 1,
             kAudioAggregateDeviceIsStackedKey: 0,
-            // Pin the aggregate to the output device's rate.
+            // Start the tap on its own rather than waiting to be told.
             //
-            // Without this the tap aggregate is clocked at roughly double the
-            // output device's rate: measured production against consumption came
-            // out at 2.02 even though both devices reported 48000 Hz. The mixer
-            // then has to discard half of every cycle, which is a decimation with
-            // no anti-aliasing filter and is what leaves the sound harsh and
-            // wrong even once the buffer level is right.
-            //
-            // Naming a main sub-device rate gives the aggregate a clock to run
-            // at, matching the device that will actually play the result.
+            // Note this aggregate deliberately has no sub-device, so it has no
+            // clock of its own to run at. That is the open problem behind the
+            // production ratio sitting at ~2x: both devices report 48000 Hz, yet
+            // the tap hands the mixer about two frames for every one the output
+            // device asks for, so the reader has to drop half of every cycle.
+            // Dropping frames chops the waveform, and no amount of filtering
+            // removes that. Adding the output device as a sub-device would give
+            // the aggregate a real clock, but it also binds the tap's channel
+            // layout to the output device, which breaks on AirPods dropping to
+            // 24 kHz mono for HFP calls.
             kAudioAggregateDeviceTapAutoStartKey: true,
             kAudioAggregateDeviceTapListKey: [
                 [
@@ -202,7 +206,7 @@ final class TapChannel {
 
         // `render` reinterprets the tap's buffers as Float. Confirm that first,
         // because a mismatch would be noise rather than an error.
-        let tapFormat = HAL.streamFormat(of: aggregateID, scope: kAudioObjectPropertyScopeInput)
+        var tapFormat = HAL.streamFormat(of: aggregateID, scope: kAudioObjectPropertyScopeInput)
         guard isSupportedMixFormat(tapFormat) else {
             Log.error("tap \(appID) format unsupported: "
                       + "id=\(tapFormat.mFormatID) flags=\(tapFormat.mFormatFlags) "
@@ -225,6 +229,7 @@ final class TapChannel {
         Log.lifecycle(String(format: "tap %@: format says %.1f Hz, device runs %.1f Hz",
                              appID, tapFormat.mSampleRate, actualRate))
         tapSampleRate.value = actualRate
+        self.tapFormat = tapFormat
 
         var newIOProc: AudioDeviceIOProcID?
         let procStatus = AudioDeviceCreateIOProcIDWithBlock(&newIOProc, aggregateID, queue) { [weak self] _, inputData, _, _, _ in
@@ -252,31 +257,52 @@ final class TapChannel {
         let bufferCount = Int(inputData.pointee.mNumberBuffers)
         guard bufferCount > 0 else { return }
 
-        // Pull the first two buffers out without allocating. Stereo mixdown
-        // taps deliver one buffer per channel.
+        // Pull the buffers out without allocating.
         let base = UnsafeRawPointer(inputData)
             .advanced(by: MemoryLayout<AudioBufferList>.offset(of: \.mBuffers)!)
         let stride = MemoryLayout<AudioBuffer>.stride
 
-        let leftBuffer = base.load(fromByteOffset: 0, as: AudioBuffer.self)
-        guard let leftData = leftBuffer.mData else { return }
-        let left = leftData.assumingMemoryBound(to: Float.self)
-        let leftFrames = Int(leftBuffer.mDataByteSize) / MemoryLayout<Float>.size
-        guard leftFrames > 0 else { return }
+        let first = base.load(fromByteOffset: 0, as: AudioBuffer.self)
+        guard let firstData = first.mData else { return }
+        let samples = firstData.assumingMemoryBound(to: Float.self)
+        let sampleCount = Int(first.mDataByteSize) / MemoryLayout<Float>.size
+        guard sampleCount > 0 else { return }
 
-        var right = left
-        if bufferCount > 1 {
-            let rightBuffer = base.load(fromByteOffset: stride, as: AudioBuffer.self)
-            if let rightData = rightBuffer.mData {
-                right = rightData.assumingMemoryBound(to: Float.self)
+        // Whether the data is interleaved is a property of the stream format, not
+        // of how many buffers happen to arrive, and getting it wrong is not a
+        // rounding error -- it halves the pitch.
+        //
+        // A stereo mixdown tap measures here as a single interleaved buffer of
+        // L0,R0,L1,R1... Treating that as planar stores sampleCount frames when the
+        // real count is half that, which is where the phantom ~2x production ratio
+        // came from: it was this miscount, not a clock discrepancy. Worse, it wrote
+        // the interleaved stream into the ring with `right` aliased to `left`, so
+        // the buffer held L0,L0,R0,R0... mislabeled as stereo pairs and the mixer
+        // replayed alternating left and right samples at half speed. That is the
+        // hollow, doubled, robotic quality, and no amount of filtering or latency
+        // work could have fixed it.
+        let interleaved = tapFormat.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
+            && tapFormat.mChannelsPerFrame > 1
+
+        let peak: Float
+        if interleaved {
+            // Interleaved stereo, one buffer: sampleCount holds L,R pairs.
+            peak = ring.writeInterleaved(samples, frameCount: sampleCount / 2)
+            framesCounter.increment(by: Int64(sampleCount / 2))
+        } else {
+            var right = samples
+            if bufferCount > 1 {
+                let second = base.load(fromByteOffset: stride, as: AudioBuffer.self)
+                if let secondData = second.mData {
+                    right = secondData.assumingMemoryBound(to: Float.self)
+                }
             }
+            // A mono source arrives as a single buffer, so `right` aliases the
+            // left and each sample becomes both channels -- the same duplication
+            // a mixdown tap performs itself.
+            peak = ring.writeDeinterleaved(samples, right, frameCount: sampleCount)
+            framesCounter.increment(by: Int64(sampleCount))
         }
-        // Mono sources are duplicated to both channels by the mixdown tap; if
-        // the HAL hands us one buffer anyway, `right` aliases `left`, which
-        // produces exactly that duplication.
-
-        let peak = ring.writeDeinterleaved(left, right, frameCount: leftFrames)
-        framesCounter.increment(by: Int64(leftFrames))
         if peak > 0 {
             sawAudio.value = true
         }
@@ -847,18 +873,15 @@ final class TapGainEngine: GainEngine {
                     limit: Int,
                     peakDecay: Float,
                     outputRate: Double = 0) {
-        // Input frames to consume per output frame.
+        // Input frames to consume per output frame: strictly one.
         //
-        // Not derived from the reported sample rates. `tapFormat.mSampleRate`
-        // reads 48000 Hz while the tap's aggregate device actually delivers
-        // roughly 96000, so the ratio computed from the two rates comes out as
-        // exactly 1.0 and no correction is ever applied -- which is why an
-        // earlier version of this correction appeared to do nothing.
-        //
-        // What actually holds the level is the buffer itself: the level is a
-        // direct measure of the surplus, and steering on it needs no knowledge of
-        // either clock. The measured production/consumption ratio is logged so
-        // the relationship stays visible instead of being inferred.
+        // Not derived from either device's reported rate, and not steered by
+        // the measured ratio. The tap and the mixer genuinely run at the same
+        // speed -- the apparent 2x surplus that used to appear here was the
+        // producer miscounting interleaved samples as frames, now fixed in
+        // `render`. So the correct base rate is exactly 1.0 and the measured
+        // ratio is logged only to keep the relationship visible rather than
+        // assumed.
         let measured = channel.ring.measureRateRatio(produced: channel.framesCopied,
                                                      consumed: channel.framesConsumed.value)
         _ = measured

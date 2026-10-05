@@ -813,4 +813,74 @@ struct ReadSteadyTests {
         let first = fresh.processLeft(0.5, 0.5)
         #expect(first <= 0.5 + 0.0001, "the filter must not amplify while charging")
     }
+    @Test("interleaved writes land in the same places as deinterleaved ones")
+    func interleavedWriteMatchesDeinterleaved() {
+        // The tap delivers interleaved stereo in one buffer. Reading it as planar
+        // halves the frame count and interleaves L and R into the wrong slots,
+        // which replays at half speed -- so the two paths have to agree exactly.
+        let planar = SampleRingBuffer(capacity: 64)
+        let interleaved = SampleRingBuffer(capacity: 64)
+
+        var left: [Float] = []
+        var right: [Float] = []
+        var packed: [Float] = []
+        for index in 0..<8 {
+            let l = Float(index) * 0.1
+            let r = Float(index) * -0.2
+            left.append(l)
+            right.append(r)
+            packed.append(l)
+            packed.append(r)
+        }
+
+        left.withUnsafeBufferPointer { lp in
+            right.withUnsafeBufferPointer { rp in
+                planar.writeDeinterleaved(lp.baseAddress!, rp.baseAddress!, frameCount: 8)
+            }
+        }
+        packed.withUnsafeBufferPointer { sp in
+            interleaved.writeInterleaved(sp.baseAddress!, frameCount: 8)
+        }
+
+        #expect(planar.availableFrames == interleaved.availableFrames,
+                "both paths must write the same number of frames")
+        #expect(interleaved.availableFrames == 8,
+                "8 stereo pairs are 8 frames, not 16")
+
+        var out = [Float](repeating: 0, count: 16)
+        interleaved.readSteady(into: &out, frameCount: 8, rateRatio: 1.0)
+        for index in 0..<8 {
+            #expect(abs(out[index * 2] - left[index]) < 0.0001,
+                    "left channel must stay on the left")
+            #expect(abs(out[index * 2 + 1] - right[index]) < 0.0001,
+                    "right channel must stay on the right")
+        }
+    }
+
+    @Test("interleaved writes wrap around the ring")
+    func interleavedWriteWraps() {
+        // The tap writes continuously, so the copy has to survive wrapping past
+        // the end of the ring rather than only working from offset zero.
+        let ring = SampleRingBuffer(capacity: 64)
+        var samples: [Float] = []
+        for index in 0..<100 {
+            samples.append(Float(index % 10))
+            samples.append(Float(index % 10) * -1)
+        }
+        samples.withUnsafeBufferPointer { sp in
+            for _ in 0..<6 { ring.writeInterleaved(sp.baseAddress!, frameCount: 50) }
+        }
+        // 300 frames written into a 64-frame ring leaves it full, which is the
+        // overflow path where the oldest audio is dropped.
+        #expect(ring.availableFrames == 64, "a full ring reports its capacity")
+
+        var out = [Float](repeating: 0, count: 100)
+        ring.readSteady(into: &out, frameCount: 50, rateRatio: 1.0)
+        // Right channel must still be the negated left after wrapping, which is
+        // the property a planar misread would destroy.
+        for index in 0..<50 {
+            #expect(abs(out[index * 2 + 1] + out[index * 2]) < 0.0001,
+                    "channels stay paired across the wrap")
+        }
+    }
 }

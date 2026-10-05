@@ -529,11 +529,10 @@ final class SampleRingBuffer {
         let correctionPerFrame = 1.0 / 2_000.0
         // Ceiling on the correction, as a multiplier on the base rate.
         //
-        // Needs to exceed 1.0 because the surplus being corrected is not a small
-        // clock skew: this tap delivers about twice the audio the mixer consumes,
-        // so a ceiling of 1.0 -- consume at most 2x -- leaves the ring
-        // permanently full. The ceiling is what lets the reader match a
-        // genuinely doubled producer instead of only trimming a slow drift.
+        // Above 1.0 so a genuine backlog can be worked off decisively rather than
+        // a few percent at a time. Now that the tap's real rate is understood the
+        // case is only ever ordinary drift, so this rarely leaves 1.0 -- it is
+        // headroom for a ring that does fall behind, not a normal operating mode.
         let maxCorrection = 3.0
         // Frames of error tolerated before correcting. Sized to cover ordinary
         // callback jitter so a healthy pipeline is left completely alone.
@@ -605,12 +604,24 @@ final class SampleRingBuffer {
             // gently enough to land on target instead of overshooting.
             let excess = Double(availableNow - targetFrames - deadbandFrames)
             let steered: Double
-            if excess <= 0 {
-                steered = ratio
-            } else {
+            if excess > 0 {
+                // Overfull: consume faster to drain the backlog.
                 let ramped = 1.0 - exp(-excess * correctionPerFrame)
                 let strength = ramped * ramped * maxCorrection
                 steered = ratio * (1.0 + strength)
+            } else {
+                // Within the deadband, including when under target. Consume a
+                // strict 1:1 and leave the level alone.
+                //
+                // Rebuilding the cushion by consuming *less* than 1:1 was tried
+                // here and the gain tests rejected it: easing off is a stretch, so
+                // it resamples, so it stops being a pass-through. Correcting only
+                // the overfull direction preserves the stronger property -- while
+                // the level is healthy the samples reaching the mixer are the
+                // samples that left the tap, bit for bit. A thin cushion costs
+                // headroom against scheduling jitter; corrupting every app's audio
+                // costs the whole feature.
+                steered = ratio
             }
             // Lowpass before decimating, and only then.
             //
@@ -671,6 +682,48 @@ final class SampleRingBuffer {
             while index < chunk {
                 let l = left[consumed + index]
                 let r = right[consumed + index]
+                destination[index * 2] = l
+                destination[index * 2 + 1] = r
+                let magnitudeL = abs(l)
+                if magnitudeL > peak { peak = magnitudeL }
+                let magnitudeR = abs(r)
+                if magnitudeR > peak { peak = magnitudeR }
+                index += 1
+            }
+            consumed += chunk
+            ringOffset = (ringOffset + chunk) & mask
+        }
+
+        writeStorage.pointee = write &+ Int64(toWrite)
+        return peak
+    }
+
+    /// Writes interleaved stereo, splitting L,R pairs into the ring's planar
+    /// layout.
+    ///
+    /// Real-time safe: a fixed-size copy loop with no allocation, mirroring
+    /// `writeDeinterleaved` so the two paths share the same wrap handling.
+    func writeInterleaved(_ samples: UnsafePointer<Float>, frameCount: Int) -> Float {
+        guard frameCount > 0 else { return 0 }
+        let write = writeStorage.pointee
+        let read = readStorage.pointee
+        let free = capacity - Int(write &- read)
+        if free < frameCount {
+            readStorage.pointee = write &+ Int64(frameCount) &- Int64(capacity)
+        }
+
+        let toWrite = min(frameCount, capacity)
+        var ringOffset = Int(write & Int64(mask))
+        var consumed = 0
+        var peak: Float = 0
+
+        while consumed < toWrite {
+            let chunk = min(toWrite - consumed, capacity - ringOffset)
+            let destination = storage + ringOffset * 2
+            var index = 0
+            while index < chunk {
+                let l = samples[(consumed + index) * 2]
+                let r = samples[(consumed + index) * 2 + 1]
                 destination[index * 2] = l
                 destination[index * 2 + 1] = r
                 let magnitudeL = abs(l)
