@@ -52,12 +52,14 @@ final class TapChannel {
 
     /// Anti-aliasing filter state for the decimating read.
     ///
-    /// This tap delivers roughly twice the frames the mixer consumes, so every
-    /// output frame is built from several input frames. Simply picking one of
-    /// them -- or averaging them without filtering first -- folds everything
-    /// above the output Nyquist frequency back down into the audible band, which
-    /// is what makes the result sound harsh and "robot"-like rather than merely
-    /// coarse. A lowpass ahead of the decimation is what keeps it clean.
+    /// Lowpass used only when the reader is genuinely decimating, which happens
+    /// when the ring is far enough above target that the reader takes more than
+    /// one input frame per output frame.
+    ///
+    /// It has to be a filter and not just a drop: averaging frames without
+    /// lowpassing first folds everything above the output Nyquist frequency back
+    /// down into the audible band, which is what makes a decimated result sound
+    /// harsh rather than merely coarse.
     let decimationFilter = DecimationFilter()
 
     /// Stream format the tap delivered, kept for diagnostics only.
@@ -335,12 +337,49 @@ final class TapChannel {
         }
     }
 
+    /// Moves the tap's clock to a new rate without dropping the ring.
+    ///
+    /// The tap's aggregate is pinned to a nominal rate, and that pin is what ties
+    /// the tap's clock to the one the mixer will run on. It is set when the tap
+    /// is created and was never revisited, so a tap that outlived an output
+    /// device change kept running at the *old* device's rate while the mixer
+    /// counted frames at the new one. The two then drift permanently, which is
+    /// audible as thin, broken or dropped audio rather than as an error anywhere.
+    ///
+    /// The ring is deliberately carried across the restart. This channel is
+    /// muting its app, so for as long as the tap is down that app has nothing
+    /// replacing it; emptying the ring would guarantee a hole in the middle of
+    /// whatever was playing, when the buffered audio would have covered it.
+    func repin(to rate: Double) {
+        guard rate > 0, let queue = renderQueue,
+              aggregateID != kAudioObjectUnknown else { return }
+        // Below a frame the difference cannot matter, and re-pinning for it would
+        // cost an interruption to fix nothing.
+        guard abs(tapSampleRate.value - rate) > 1 else { return }
+
+        let previousRate = tapSampleRate.value
+        let wasMuting = isMuting
+        stop(preservingRing: true)
+        let status = start(queue: queue, muting: wasMuting, outputRateHint: rate)
+        guard status == noErr else {
+            Log.error("tap \(appID): could not re-pin to \(rate) Hz "
+                      + "(fourcc \(fourcc(status)))); audio left untouched")
+            isMuting = false
+            return
+        }
+        Log.lifecycle(String(format: "tap %@: re-pinned %.0f Hz -> %.0f Hz",
+                             appID, previousRate, rate))
+    }
+
     /// Frames the ring must hold before a probe may start muting. Roughly 40 ms
     /// at 48 kHz: long enough that the mixer has a cushion to absorb a late
     /// cycle, short enough to be inaudible as added latency.
     private static let primingFrames = 2048
 
-    func stop() {
+    /// Tears the tap down. `preservingRing` keeps the buffered audio, which is
+    /// the one piece of state that must survive a restart caused by something
+    /// other than going away -- see `repin(to:)`.
+    func stop(preservingRing: Bool = false) {
         if let ioProc = ioProcID {
             _ = AudioDeviceStop(aggregateID, ioProc)
             _ = AudioDeviceDestroyIOProcID(aggregateID, ioProc)
@@ -354,8 +393,10 @@ final class TapChannel {
             _ = AudioHardwareDestroyProcessTap(tapID)
             tapID = kAudioObjectUnknown
         }
-        ring.reset()
-        decimationFilter.reset()
+        if !preservingRing {
+            ring.reset()
+            decimationFilter.reset()
+        }
         peak.value = 0
         // A stopped channel is not under mixer control whatever it was before:
         // nothing is reading the tap, so the app is playing on its own again.
@@ -436,6 +477,13 @@ final class TapGainEngine: GainEngine {
     /// Deadline before which a missing cycle is not yet a stall.
     private var mixerStartDeadline = Date.distantPast
 
+    /// The rebuild a device change has scheduled but not yet performed. Any
+    /// further change replaces it rather than queueing behind it.
+    private var pendingRebuild: DispatchWorkItem?
+    /// Device changes seen since the last rebuild, for the log line that says
+    /// whether coalescing actually did anything.
+    private var deferredRebuilds = 0
+
     private var watchdogTimer: DispatchSourceTimer?
     /// `quit()` stops the model and `applicationWillTerminate` stops it again,
     /// so shutdown has to survive being called twice. It also has to make later
@@ -476,6 +524,22 @@ final class TapGainEngine: GainEngine {
         startWatchdog()
     }
 
+    /// The rate a new tap should be pinned to: the output device's own rate when
+    /// it can be read, otherwise the nominal 48 kHz that built-in and most USB
+    /// devices run at.
+    ///
+    /// This used to be a hardcoded default parameter, which meant every tap was
+    /// pinned to 48 kHz no matter what the device actually did. That happened to
+    /// match a built-in output and quietly did not match anything else, so on a
+    /// device running at a different rate the tap's clock and the mixer's were
+    /// different clocks from the start.
+    static func tapRateHint() -> Double {
+        let device = HAL.defaultOutputDevice
+        guard device != 0 else { return 48_000 }
+        let rate = HAL.outputStreamFormat(device).mSampleRate
+        return rate > 0 ? rate : 48_000
+    }
+
     /// Level the reader steers the ring back toward, in frames.
     ///
     /// Small on purpose. This is the latency the mixer adds to every tapped app,
@@ -503,7 +567,8 @@ final class TapGainEngine: GainEngine {
                 // Start muted only once capture has been proven this session. Until then
                 // the tap is a passive probe, so an app whose audio we cannot
                 // capture keeps playing instead of being silenced.
-                let status = channel.start(queue: self.tapQueue, muting: self.captureProven)
+                let status = channel.start(queue: self.tapQueue, muting: self.captureProven,
+                                           outputRateHint: Self.tapRateHint())
                 guard status == noErr else {
                     Log.error("tap start failed for \(channel.appID): \(fourcc(status))")
                     return
@@ -598,7 +663,15 @@ final class TapGainEngine: GainEngine {
     }
 
     func shutdown() {
-        stateLock.withLock { isShutDown = true }
+        stateLock.withLock {
+            isShutDown = true
+            // Drop any rebuild a device change scheduled. Cancelling means it
+            // never runs; without this the guard in `performDeferredRebuild`
+            // would be the only thing standing between a quit and an orphaned
+            // IOProc.
+            pendingRebuild?.cancel()
+            pendingRebuild = nil
+        }
         watchdogTimer?.cancel()
         watchdogTimer = nil
         // Never call this from the control queue: `sync` onto a queue that is
@@ -875,13 +948,18 @@ final class TapGainEngine: GainEngine {
                     outputRate: Double = 0) {
         // Input frames to consume per output frame: strictly one.
         //
-        // Not derived from either device's reported rate, and not steered by
-        // the measured ratio. The tap and the mixer genuinely run at the same
-        // speed -- the apparent 2x surplus that used to appear here was the
-        // producer miscounting interleaved samples as frames, now fixed in
-        // `render`. So the correct base rate is exactly 1.0 and the measured
-        // ratio is logged only to keep the relationship visible rather than
-        // assumed.
+        // This is a claim about the two clocks, not a constant of nature, and it
+        // holds for two reasons that are both load-bearing:
+        //
+        //   * the tap is pinned to the output device's own sample rate, so its
+        //     aggregate and the mixer are nominally the same rate, and
+        //   * `kAudioSubTapDriftCompensationKey` makes CoreAudio slave the tap's
+        //     clock to the device rather than free-running it.
+        //
+        // The 2x surplus that used to appear here was neither: it was the
+        // producer miscounting interleaved samples as frames, fixed in `render`.
+        // The measured ratio is still logged, so a genuine clock mismatch shows
+        // up in the health line instead of being silently absorbed.
         let measured = channel.ring.measureRateRatio(produced: channel.framesCopied,
                                                      consumed: channel.framesConsumed.value)
         _ = measured
@@ -1041,7 +1119,7 @@ final class TapGainEngine: GainEngine {
         guard !pending.isEmpty else { return }
         for channel in pending {
             Log.lifecycle("promoting verified tap to muting: \(channel.appID)")
-            channel.promoteToMuting()
+            channel.promoteToMuting(outputRateHint: Self.tapRateHint())
         }
     }
 
@@ -1139,16 +1217,79 @@ final class TapGainEngine: GainEngine {
     }
 
     /// Rebuilds the mixer after the default output device or its format changes.
+    ///
+    /// Coalesced, because one user-visible switch is not one change. macOS
+    /// reports the default device moving, then the new device's stream format
+    /// settling, and `OutputDeviceMonitor` also polls every two seconds on top of
+    /// those notifications -- so a single switch arrives as several distinct
+    /// signatures and used to rebuild the mixer once per signature.
+    ///
+    /// That is expensive in a way that is easy to miss when reading the code:
+    /// every rebuild destroys and recreates the output IOProc, and while it does
+    /// not exist the taps are still `.mutedWhenTapped`, so every app being mixed
+    /// is silent for the duration. A Bluetooth device that takes seconds to wake
+    /// therefore produced seconds of silence *per notification*, queued end to
+    /// end. The new device was not the problem; how many times we rebuilt
+    /// around it was.
+    ///
+    /// So a change schedules the rebuild rather than performing it, and a later
+    /// change in the same window replaces the pending one. Waiting also means
+    /// the mixer is built around a format that has stopped moving.
     func handleDeviceChange() {
         controlQueue.async { [weak self] in
-            guard let self else { return }
+            guard let self, !self.isShutDown else { return }
             self.stateLock.withLock {
-                guard self.mixerProcID != nil else { return }
-                // Taps keep their own clock, so they survive a device change;
-                // only the mixer has to be rebuilt around the new format.
-                self.stopMixer()
-                self.startMixer()
+                self.pendingRebuild?.cancel()
+                self.deferredRebuilds += 1
+                let work = DispatchWorkItem { [weak self] in
+                    self?.performDeferredRebuild()
+                }
+                self.pendingRebuild = work
+                self.controlQueue.asyncAfter(deadline: .now() + Self.deviceSettleDelay,
+                                              execute: work)
             }
+        }
+    }
+
+    private static let deviceSettleDelay: TimeInterval = 0.35
+
+    /// How long the output format must hold still before the mixer is rebuilt
+    /// around it. Long enough to swallow the burst of notifications a switch
+    /// produces, short enough that the user is not listening to a gap while the
+    /// engine decides whether it has finished changing its mind.
+    private func performDeferredRebuild() {
+        stateLock.withLock {
+            pendingRebuild = nil
+            // A shutdown that landed between the change and here must not be
+            // undone: this would start a mixer that nothing is left to stop, and
+            // hold the output device awake for the rest of the session.
+            guard !isShutDown else { return }
+            let coalesced = deferredRebuilds
+            deferredRebuilds = 0
+            // Nothing was running, so there is nothing to rebuild and starting one
+            // would hold the output device awake for no reason.
+            guard mixerProcID != nil else { return }
+
+            let device = HAL.defaultOutputDevice
+            let rate = Self.tapRateHint()
+            let previousDevice = outputDevice
+            let previousRate = outputFormat.mSampleRate
+
+            // Move the taps onto the new clock before the mixer starts counting
+            // frames at it. Doing it in this order means the two clocks agree
+            // from the first cycle, instead of running visibly apart while the
+            // mixer settles.
+            if abs(rate - previousRate) > 1, !channels.isEmpty {
+                for channel in channels.values {
+                    channel.repin(to: rate)
+                }
+            }
+
+            stopMixer()
+            startMixer()
+            Log.lifecycle(String(
+                format: "device change: rebuilt mixer device %u -> %u, rate %.0f -> %.0f Hz, %d change(s) coalesced",
+                previousDevice, device, previousRate, rate, coalesced))
         }
     }
 }
