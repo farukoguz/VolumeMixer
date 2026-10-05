@@ -1,28 +1,3 @@
-# Compiled class file
-*.class
-
-# Log file
-*.log
-
-# BlueJ files
-*.ctxt
-
-# Mobile Tools for Java (J2ME)
-.mtj.tmp/
-
-# Package Files #
-*.jar
-*.war
-*.nar
-*.ear
-*.zip
-*.tar.gz
-*.rar
-
-# virtual machine crash logs, see http://www.java.com/en/download/help/error_hotspot.xml
-hs_err_pid*
-replay_pid*
-
 # macOS
 .DS_Store
 
@@ -32,3 +7,21 @@ build/
 
 # Icon generator intermediate; the .icns is the tracked artefact
 VolumeMixer.iconset/
+
+# SwiftPM build products
+*.xcodeproj
+.swiftpm/
+
+# Assembled, signed application bundle produced by Scripts/build-app.sh.
+# Rebuildable, and it carries a code signature tied to one machine's identity.
+
+# Signing material must never enter the repository. The development identity is
+# imported into the login keychain instead; see the README's signing section.
+*.p12
+*.cer
+*.p8
+
+# Verification output
+*.log
+*.wav
+
