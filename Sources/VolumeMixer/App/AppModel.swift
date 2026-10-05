@@ -127,6 +127,14 @@ final class AppModel: ObservableObject {
             }
         }
 
+        if let tapEngine = engine as? TapGainEngine {
+            tapEngine.onTapsReleased = { [weak self] appIDs in
+                Task { @MainActor in
+                    self?.engineReleasedTaps(appIDs)
+                }
+            }
+        }
+
         discovery.start()
         deviceMonitor.start()
         refreshDevices()
@@ -369,6 +377,24 @@ final class AppModel: ObservableObject {
         }
         attachedProcessKeys.formUnion(desired.keys)
         detachExpiredProcesses()
+    }
+
+    /// Forgets attachments the engine dropped on its own.
+    ///
+    /// A permission denial or a stalled mixer releases every tap from inside the
+    /// engine. The app's own bookkeeping is not involved, so it went on believing
+    /// those taps were live: the apps stayed listed, the taps stayed gone, and
+    /// `syncEngineAttachments` skipped them forever because it only attaches what
+    /// it does not already have. The result was a mixer that looked normal and
+    /// controlled nothing, which is exactly what "it disappears" looked like.
+    ///
+    /// Clearing the key lets the next sync re-attach, and re-applying the stored
+    /// levels there is what restores the slider positions.
+    private func engineReleasedTaps(_ appIDs: [String]) {
+        guard !appIDs.isEmpty else { return }
+        let released = Set(appIDs)
+        attachedProcessKeys.subtract(released)
+        pendingDetach = pendingDetach.filter { !released.contains($0.key) }
     }
 
     /// Releases taps whose app has stayed quiet for longer than the grace period.

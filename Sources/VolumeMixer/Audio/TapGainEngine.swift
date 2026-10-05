@@ -367,6 +367,11 @@ final class TapChannel {
             isMuting = false
             return
         }
+        // `stop` clears this, and `start` only sets it for a freshly created tap
+        // path. Leaving it false told the watchdog this channel was a probe, so
+        // one re-pin mid-session was enough for the silence check to conclude the
+        // permission had been revoked and release every tap in the session.
+        isUnderMixerControl.value = wasMuting
         Log.lifecycle(String(format: "tap %@: re-pinned %.0f Hz -> %.0f Hz",
                              appID, previousRate, rate))
     }
@@ -476,6 +481,14 @@ final class TapGainEngine: GainEngine {
     private let mixerStartupGrace: TimeInterval = 3
     /// Deadline before which a missing cycle is not yet a stall.
     private var mixerStartDeadline = Date.distantPast
+    /// Cycle count when the current mixer was started. Comparing against this is
+    /// how "has not run yet" is told apart from "ran and then stopped", without
+    /// the audio thread having to write anything.
+    private var cyclesAtMixerStart: Int64 = 0
+    /// Hard cap on how long a mixer may go without ever producing a cycle.
+    /// Past this the device is not merely slow to wake and the taps are released.
+    private static let mixerFirstCycleCeiling: TimeInterval = 30
+    private var mixerFirstCycleDeadline = Date.distantPast
 
     /// The rebuild a device change has scheduled but not yet performed. Any
     /// further change replaces it rather than queueing behind it.
@@ -483,6 +496,10 @@ final class TapGainEngine: GainEngine {
     /// Device changes seen since the last rebuild, for the log line that says
     /// whether coalescing actually did anything.
     private var deferredRebuilds = 0
+
+    /// Called when the engine releases every tap on its own, with the app IDs
+    /// affected. The app uses this to forget attachments it did not ask to drop.
+    var onTapsReleased: (([String]) -> Void)?
 
     private var watchdogTimer: DispatchSourceTimer?
     /// `quit()` stops the model and `applicationWillTerminate` stops it again,
@@ -780,11 +797,13 @@ final class TapGainEngine: GainEngine {
             return
         }
         lastMixerCycle = mixerCycles.value
+        cyclesAtMixerStart = mixerCycles.value
         // Waking a dock or a Bluetooth device takes seconds, and the first
         // IOProc cycle only arrives once it is awake. Without this the watchdog
         // would see no cycles, call it a stall, and release every tap for a
         // mixer that is merely still starting.
         mixerStartDeadline = Date().addingTimeInterval(mixerStartupGrace)
+        mixerFirstCycleDeadline = Date().addingTimeInterval(Self.mixerFirstCycleCeiling)
         // A previous failure (an unsupported device, say) should not stick once
         // the device has been replaced with something that works.
         availability = .ready
@@ -1035,12 +1054,39 @@ final class TapGainEngine: GainEngine {
         let previous = lastMixerCycle
         lastMixerCycle = now
 
-        guard now == previous else { return }
+        guard now == previous else {
+            // It is running, so it is not stalled. This also re-arms the "never
+            // produced a cycle" cap: a mixer that eventually starts is not a
+            // mixer that needs tearing down.
+            mixerFirstCycleDeadline = .distantPast
+            return
+        }
         // A mixer that has only just been created has not necessarily produced a
         // cycle yet, so silence here is not yet evidence of a stall.
         guard Date() >= mixerStartDeadline else { return }
 
-        // The mixer is running but not being serviced. Anything tapped right now
+        // Silence before the *first* cycle is not a stall at all -- it is a device
+        // that has not finished waking. Releasing here was what made a switch to a
+        // slow device appear to work and then vanish: the taps came back, the
+        // device took longer than the grace period to start, the watchdog read
+        // that silence as a dead mixer, and it dropped everything again.
+        //
+        // So the first cycle is waited for, and only for as long as a device could
+        // plausibly take. Past that ceiling it really is broken.
+        if now == cyclesAtMixerStart {
+            guard Date() < mixerFirstCycleDeadline else {
+                releaseAllTaps(reason: "mixer never produced a cycle")
+                availability = .failed("mixer did not start; audio restored, gain disabled")
+                return
+            }
+            // Not stalled, not started. Wait, and stop counting silence as
+            // evidence by pushing the deadline out rather than releasing.
+            mixerStartDeadline = Date().addingTimeInterval(mixerStartupGrace)
+            return
+        }
+
+        // The mixer has run before and has now stopped. That is a genuine stall:
+        // it is running but not being serviced. Anything tapped right now
         // is muted with no replacement path, so release everything.
         releaseAllTaps(reason: "mixer stalled")
         availability = .failed("mixer stalled; audio restored, gain disabled")
@@ -1184,6 +1230,12 @@ final class TapGainEngine: GainEngine {
             retire(channel)
         }
         stopMixer()
+        // A denial or a stall clears the engine's channels without going through
+        // the app's own detach path, so the app still believes those taps exist
+        // and never re-attaches them. It has to be told, or the engine stays
+        // empty for the rest of the session: everything muted, nothing listed,
+        // and nothing that would ever bring the mixer back.
+        onTapsReleased?(released.map(\.appID))
         Log.lifecycle("released \(released.count) tap(s): \(reason)")
     }
 
