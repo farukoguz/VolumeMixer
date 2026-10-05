@@ -337,43 +337,35 @@ final class TapChannel {
         }
     }
 
-    /// Moves the tap's clock to a new rate without dropping the ring.
+    /// Stops silencing the app so its audio keeps reaching the output on its own.
     ///
-    /// The tap's aggregate is pinned to a nominal rate, and that pin is what ties
-    /// the tap's clock to the one the mixer will run on. It is set when the tap
-    /// is created and was never revisited, so a tap that outlived an output
-    /// device change kept running at the *old* device's rate while the mixer
-    /// counted frames at the new one. The two then drift permanently, which is
-    /// audible as thin, broken or dropped audio rather than as an error anywhere.
+    /// Used for a device handover. The tap is `.mutedWhenTapped`, so the instant
+    /// the mixer goes away the app it was holding silent has nothing replacing it
+    /// -- and rebuilding the output IOProc on a new device can take seconds. That
+    /// is the gap a switch was heard to have, and it could not be closed any other
+    /// way: the audio is on its way to a device our mixer has not started on yet.
     ///
-    /// The ring is deliberately carried across the restart. This channel is
-    /// muting its app, so for as long as the tap is down that app has nothing
-    /// replacing it; emptying the ring would guarantee a hole in the middle of
-    /// whatever was playing, when the buffered audio would have covered it.
-    func repin(to rate: Double) {
-        guard rate > 0, let queue = renderQueue,
-              aggregateID != kAudioObjectUnknown else { return }
-        // Below a frame the difference cannot matter, and re-pinning for it would
-        // cost an interruption to fix nothing.
-        guard abs(tapSampleRate.value - rate) > 1 else { return }
-
-        let previousRate = tapSampleRate.value
+    /// Failing *open* keeps the sound coming, at the app's own volume, until the
+    /// new mixer is running. `mix` refuses to sum a channel whose tap is not
+    /// muting, so nothing is doubled while it is open, and the watchdog's existing
+    /// promotion path puts the tap back under mixer control -- and the user's gain
+    /// back with it -- as soon as there is somewhere for the samples to go.
+    ///
+    /// The ring is preserved because this app is mid-track, and the buffered
+    /// audio is what covers the switch.
+    func failOpen(outputRateHint: Double? = nil) {
+        guard let queue = renderQueue, aggregateID != kAudioObjectUnknown else { return }
         let wasMuting = isMuting
+        guard wasMuting else { return }
         stop(preservingRing: true)
-        let status = start(queue: queue, muting: wasMuting, outputRateHint: rate)
-        guard status == noErr else {
-            Log.error("tap \(appID): could not re-pin to \(rate) Hz "
+        let status = start(queue: queue, muting: false,
+                           outputRateHint: outputRateHint ?? tapSampleRate.value)
+        if status != noErr {
+            Log.error("tap \(appID): could not open for handover "
                       + "(fourcc \(fourcc(status)))); audio left untouched")
-            isMuting = false
             return
         }
-        // `stop` clears this, and `start` only sets it for a freshly created tap
-        // path. Leaving it false told the watchdog this channel was a probe, so
-        // one re-pin mid-session was enough for the silence check to conclude the
-        // permission had been revoked and release every tap in the session.
-        isUnderMixerControl.value = wasMuting
-        Log.lifecycle(String(format: "tap %@: re-pinned %.0f Hz -> %.0f Hz",
-                             appID, previousRate, rate))
+        Log.lifecycle("tap \(appID): open for handover, app audible on its own")
     }
 
     /// Frames the ring must hold before a probe may start muting. Roughly 40 ms
@@ -383,7 +375,7 @@ final class TapChannel {
 
     /// Tears the tap down. `preservingRing` keeps the buffered audio, which is
     /// the one piece of state that must survive a restart caused by something
-    /// other than going away -- see `repin(to:)`.
+    /// other than going away -- see `failOpen(outputRateHint:)`.
     func stop(preservingRing: Bool = false) {
         if let ioProc = ioProcID {
             _ = AudioDeviceStop(aggregateID, ioProc)
@@ -1293,6 +1285,20 @@ final class TapGainEngine: GainEngine {
             self.stateLock.withLock {
                 self.pendingRebuild?.cancel()
                 self.deferredRebuilds += 1
+                // Open the taps on the *first* signal rather than after the settle
+                // delay. Apps migrate to the new device as soon as it becomes
+                // default, which is before the rebuild -- so during the delay they
+                // are muted, the mixer is still pointed at the old device, and the
+                // replacement path for their audio is already gone. That delay was
+                // a gap in its own right, before the rebuild was even attempted.
+                //
+                // `failOpen` is a no-op once a channel is already open, so the
+                // extra signals a single switch produces cost nothing.
+                if self.deferredRebuilds == 1 {
+                    for channel in self.channels.values {
+                        channel.failOpen()
+                    }
+                }
                 let work = DispatchWorkItem { [weak self] in
                     self?.performDeferredRebuild()
                 }
@@ -1327,13 +1333,19 @@ final class TapGainEngine: GainEngine {
             let previousDevice = outputDevice
             let previousRate = outputFormat.mSampleRate
 
-            // Move the taps onto the new clock before the mixer starts counting
-            // frames at it. Doing it in this order means the two clocks agree
-            // from the first cycle, instead of running visibly apart while the
-            // mixer settles.
-            if abs(rate - previousRate) > 1, !channels.isEmpty {
+            // Every app being mixed is muted right now, and the mixer they depend
+            // on is about to be destroyed and rebuilt. Open the taps first so the
+            // sound reaches the output on its own across that window, then move
+            // them onto the new clock, and only then restart the mixer.
+            //
+            // Order matters in both directions. Opening first means no instant
+            // exists where a muted app has no mixer to replace it. Leaving the
+            // mixer running over unopened taps would mean the opposite: the taps
+            // are still muting while nothing reads them.
+            if !channels.isEmpty {
+                let rateChanged = abs(rate - previousRate) > 1
                 for channel in channels.values {
-                    channel.repin(to: rate)
+                    channel.failOpen(outputRateHint: rateChanged ? rate : nil)
                 }
             }
 
