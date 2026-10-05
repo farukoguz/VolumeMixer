@@ -7,6 +7,48 @@ without installing a virtual audio driver or a kernel extension. The system outp
 device, its volume and its selection stay under your control; the mixer only
 replaces the *mixing* of app audio, not the device itself.
 
+## Install
+
+Download **VolumeMixer.app** from the top of this page, then:
+
+1. **Move it to Applications.** Drag `VolumeMixer.app` onto the `Applications`
+   folder in your Dock, or select it and press `⌘C` then `⌘V`. Dragging it out of
+   the download location matters: leaving it in `Downloads` works, but macOS
+   treats that folder specially and you can end up launching a stale copy after
+   updating.
+
+   If macOS asks to move it, choose **Applications**. If the folder is not
+   writable — rare on a personal Mac — drag into your user folder instead
+   (`⌘⇧H`, then `Applications`), and it will run from there.
+
+2. **Open it once by hand.** macOS refuses to launch a build it cannot attribute
+   to a trusted developer:
+
+   > Volume Mixer cannot be opened because the developer cannot be verified
+
+   Right-click (or Control-click) `VolumeMixer.app` in Applications, choose
+   **Open**, and confirm. If the Open button is greyed out, choose **Open anyway**
+   in the same dialog. macOS remembers the decision, so this is once per Mac, not
+   once per launch.
+
+   This build is not signed with Developer ID and not notarised, so this step is
+   expected and there is nothing to fix.
+
+3. **Grant Screen & System Audio Recording.** System Settings → Privacy &
+   Security → Screen & System Audio Recording, then add Volume Mixer (the `+`
+   button) and tick it.
+
+   Without this the app is not obviously broken, which is the trap worth knowing
+   about: it launches, lists whatever is playing, meters nothing, and every slider
+   does nothing without saying why. If a slider has no effect, check this first.
+
+**To remove it**, drag Volume Mixer from Applications to the Trash. The permission
+entry can stay behind; it does nothing without the app.
+
+Volume Mixer lives in the menu bar, not the Dock. Look for the speaker icon in the
+top-right, next to the clock — there is no window to look for, and it may already
+be running when the app finishes launching.
+
 ## Requirements
 
 - macOS 14.2 or newer. `AudioHardwareCreateProcessTap` was introduced in 14.2, and it
@@ -14,6 +56,8 @@ replaces the *mixing* of app audio, not the device itself.
 - Screen & System Audio Recording permission (see [Permissions](#permissions)).
 
 ## Build and run
+
+Just want to use it, [install the app](#install). To work on it:
 
 ```bash
 swift build            # library/binary check
@@ -412,6 +456,12 @@ Paths are from the repository root, which is also the SwiftPM package root.
 | `Scripts/make-icon.swift` | draws `Resources/AppIcon.icns` from code |
 | `Resources/AppIcon.icns` | the bundle icon, named by `CFBundleIconFile` |
 | `Resources/Info.plist` | bundle identity and the two privacy usage strings |
+| `VolumeMixer.app` | the built app, committed so it can be downloaded |
+
+`build/VolumeMixer.app` and `VolumeMixer.app` are both ignored by git except where
+the built app is deliberately committed. The one in `build/` is your working copy
+and gets overwritten by the next `build-app.sh`; the committed one is the artefact
+that ships, and `git status` will show it as modified whenever you rebuild.
 
 ### Regenerating the icon
 
