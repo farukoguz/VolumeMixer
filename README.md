@@ -12,10 +12,34 @@ Requires **macOS 14.2 or newer**.
 
 1. Download the **VolumeMixer** disk image from
    [Releases](https://github.com/farukoguz/VolumeMixer/releases) and open it.
+
+   Check it before you go any further — this build is not notarised, so macOS has
+   no way to tell you whether what you downloaded is what was published:
+
+   ```sh
+   shasum -a 256 -c VolumeMixer-*.dmg.sha256   # run in ~/Downloads
+   ```
+
+   The filename has to match the checksum exactly. A mismatch means the download
+   is truncated or altered — do not open it. The `.sha256` file sits next to the
+   image on the release page.
 2. Drag **Volume Mixer** onto the **Applications** shortcut, then eject the disk.
-3. Right-click Volume Mixer in Applications and choose **Open**. macOS will
-   otherwise say it cannot verify the developer — this build is not notarised, so
-   the step is expected, and macOS remembers it after the first time.
+3. Clear the quarantine flag. This build is not notarised, so macOS refuses it
+   before anything inside it gets a chance to run:
+
+   ```sh
+   /usr/bin/xattr -cr /Applications/VolumeMixer.app
+   ```
+
+   Then launch Volume Mixer normally.
+
+   This removes macOS's record of where the app came from, so macOS can no longer
+   warn you about an unnotarised build. Only run it on an app you built yourself or
+   checked against the release checksum.
+
+   Prefer the mouse? Right-click Volume Mixer in Applications and choose **Open**
+   instead. macOS remembers that choice, but it does not always clear the flag on
+   everything inside the bundle, so the command above is the reliable one.
 4. System Settings → Privacy & Security → **Screen & System Audio Recording** →
    add Volume Mixer.
 
@@ -25,17 +49,6 @@ next to the clock.
 > **If a slider does nothing, step 4 is almost certainly why.** The app launches and
 > lists whatever is playing, so a missing permission looks like a broken app rather
 > than a misconfigured one. Nothing reports an error.
-
-Each release page lists a SHA-256 checksum for its disk image. Worth checking, since
-this build is not notarised and macOS has no way to tell you whether what you
-downloaded is what was published:
-
-```sh
-shasum -a 256 ~/Downloads/VolumeMixer-*.dmg
-```
-
-The name has to match the checksum exactly. A mismatch means the download is
-truncated or altered — do not open it.
 
 To uninstall, drag it from Applications to the Trash.
 
