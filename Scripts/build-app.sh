@@ -70,6 +70,18 @@ else
 fi
 echo "==> architectures: $(lipo -archs "$BIN")"
 
+# Strip before signing, never after. `strip` rewrites the binary, which
+# invalidates an existing signature, so this has to precede codesign.
+#
+# A release build keeps its symbol table, and the linker leaves one `N_OSO` entry
+# per source file recording the absolute path of the object file it came from.
+# Those paths are built from wherever the build ran, so a binary assembled on one
+# Mac carries that user's home directory, account name and project path in
+# anything that receives it. Removing them also drops the binary by roughly half,
+# which matters for a file people download.
+echo "==> stripping"
+strip -S -x "$BIN"
+
 echo "==> assembling $APP"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
