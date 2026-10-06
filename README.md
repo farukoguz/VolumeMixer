@@ -8,6 +8,8 @@ stay under your control; only the *mixing* of app audio is replaced.
 
 Requires **macOS 14.2 or newer**.
 
+![The Volume Mixer panel, one row per app with a slider, mute button and level meter](docs/images/screenshot.png)
+
 ## Install
 
 1. Download the **VolumeMixer** disk image from
