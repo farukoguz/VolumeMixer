@@ -58,18 +58,18 @@ To uninstall, drag it from Applications to the Trash.
 
 ```mermaid
 flowchart LR
-    A["your apps"] -->|"one process tap each"| R["ring buffer"]
-    R --> M["mixer<br/>gain · mute · meter"]
-    M --> O["your output device"]
+    A["your apps"] -->|"copy each app's sound"| B["set each<br/>app's volume"]
+    B --> C["add them<br/>together"]
+    C --> D["your speakers"]
 ```
 
-Every app that makes noise gets its own tap and its own row. The tap mutes only
-that process, the mixer reads all the rings and applies your gain, then writes to
-the default output. Your device stays the default and keeps its own volume control
-— only the *mixing* is replaced.
+Each app's sound is copied as it plays, turned down to whatever its slider says,
+and the results are added together before being sent to your speakers. Your output
+device stays the default and keeps its own volume control — Volume Mixer only
+adjusts the balance between apps.
 
-There is no virtual audio driver, no kernel extension, and nothing installed at the
-system level.
+There is no virtual audio driver and no kernel extension; nothing is installed at
+the system level.
 
 ## Customising the look
 
