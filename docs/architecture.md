@@ -7,11 +7,13 @@ strange until you know what went wrong without them.
 
 ## How it works
 
-```
-audible process ──▶ process tap (mute-while-tapped) ──▶ RT-safe ring
-                                                                  │
-default output ◀── tap-only aggregate device ◀── one mixer IOProc ◀┘
-                     gain + peak metering, sum of all channels
+```mermaid
+flowchart LR
+    P["audible process"] --> T["process tap<br/>mute-while-tapped"]
+    T --> R["RT-safe ring"]
+    R --> M["one mixer IOProc<br/>gain + peak metering<br/>sum of all channels"]
+    M --> A["tap-only<br/>aggregate device"]
+    A --> O["default output"]
 ```
 
 - **Discovery** (`Sources/VolumeMixer/Audio/ProcessDiscovery.swift`) enumerates core-audio processes,
@@ -72,6 +74,62 @@ default output ◀── tap-only aggregate device ◀── one mixer IOProc �
   then re-tap it with a pop, so a tap is held for a second first. An app that really
   has stopped is silent anyway, and one that resumes inside the window is still
   correctly tapped with nothing to undo.
+
+## Output device switches
+
+One switch to the user is not one event to Core Audio: macOS reports the default
+device moving, then the new stream format settling, and `OutputDeviceMonitor` polls
+every 2s on top of those notifications. So a single switch arrives as several
+distinct signatures, and every signature used to destroy and recreate the output
+IOProc. While no IOProc exists the taps stay muted, so each rebuild was a *silent*
+gap — a Bluetooth device that takes seconds to wake produced seconds of silence
+per notification, queued end to end.
+
+```mermaid
+sequenceDiagram
+    participant CA as Core Audio
+    participant E as engine control queue
+    participant C as TapChannel
+    participant M as mixer IOProc
+
+    CA->>E: handleDeviceChange()
+    Note over E: defer the rebuild,<br/>deviceSettleDelay = 0.35 s
+    E->>C: failOpen() on the first signal only
+    Note over C: taps pass audio through untouched,<br/>so apps stay audible during the gap
+    CA->>E: further change signatures<br/>cancel + reschedule, count as coalesced
+    E->>E: performDeferredRebuild()
+    E->>C: failOpen(outputRateHint:) if the rate changed
+    E->>M: stopMixer()
+    E->>M: startMixer() at the settled device's real rate
+    Note over M: ring carried across the restart
+    M-->>E: first cycle
+    Note over E: cyclesAtMixerStart advances,<br/>so the watchdog can tell<br/>"never ran" from "ran and stopped"
+```
+
+Four things carry the audio across that window:
+
+- **Fail open first, rebuild after.** `failOpen()` runs on the *first* change
+  signal, before the 350 ms settle delay, because apps migrate to the new device as
+  soon as it becomes default — long before the rebuild. Waiting would have left them
+  muted with the mixer still pointed at the old device. `failOpen` is a no-op on a
+  channel that is already open, so the surplus signatures cost nothing.
+- **Order inside `performDeferredRebuild()` matters both ways.** The taps are opened
+  *before* `stopMixer()`, so no instant exists where a muted app has no mixer to
+  replace it; leaving the mixer running over still-muting taps would be the mirror
+  image of the same hole.
+- **The ring survives the restart**, so a sample written microseconds before
+  `stopMixer()` is still there for `startMixer()`.
+- **The rate is read, not assumed.** The old code hardcoded 48 kHz, which is wrong
+  on any device that runs at 44.1 kHz.
+
+### The watchdog must not see a gap as a stall
+
+Rebuilds are invisible to the watchdog, which would otherwise call a mixer stalled
+the moment it was replaced. `cyclesAtMixerStart` records the cycle count at
+`startMixer()`, and `mixerFirstCycleDeadline` gives it `mixerFirstCycleCeiling`
+(30 s) to produce its first cycle. Only a mixer that has run and then stopped counts
+as stalled — one that has not cycled yet is a device still waking, and waking a dock
+takes longer than the watchdog interval.
 
 ## Tests
 

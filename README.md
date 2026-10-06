@@ -52,6 +52,34 @@ next to the clock.
 
 To uninstall, drag it from Applications to the Trash.
 
+## How it works
+
+```mermaid
+flowchart LR
+    A["your apps"] -->|"one process tap each"| R["ring buffer"]
+    R --> M["mixer<br/>gain · mute · meter"]
+    M --> O["your output device"]
+```
+
+Every app that makes noise gets its own tap and its own row. The tap mutes only
+that process, the mixer reads all the rings and applies your gain, then writes to
+the default output. Your device stays the default and keeps its own volume control
+— only the *mixing* is replaced.
+
+There is no virtual audio driver, no kernel extension, and nothing installed at the
+system level.
+
+## Customising the look
+
+The UI is deliberately **not themed** — it follows macOS. Every colour it uses is a
+system semantic colour (`.secondary`, `.green`, `.yellow`, `.red`), so it picks up
+light/dark appearance, increased contrast and your accent colour from System
+Settings with no code of its own. There is no theme object, no style file and no
+colour injection point; `settings.json` holds per-app levels and mute state only.
+
+To restyle it, edit [`MixerView`](Sources/VolumeMixer/UI/MixerView.swift) and swap
+those semantic colours for your own.
+
 ## Build from source
 
 ```sh
