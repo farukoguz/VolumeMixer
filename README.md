@@ -52,6 +52,11 @@ next to the clock.
 > lists whatever is playing, so a missing permission looks like a broken app rather
 > than a misconfigured one. Nothing reports an error.
 
+The repository also carries a prebuilt `VolumeMixer.app` at its root, so a plain
+`git clone` gives you something to run without Xcode. It is only refreshed when
+someone commits a new copy — [Releases](https://github.com/farukoguz/VolumeMixer/releases)
+is always the current version.
+
 To uninstall, drag it from Applications to the Trash.
 
 ## How it works
@@ -103,4 +108,4 @@ For how it works and why, see [docs/architecture.md](docs/architecture.md).
 
 ## Licence
 
-MIT.
+Apache License 2.0 — see [LICENSE](LICENSE).

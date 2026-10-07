@@ -12,8 +12,9 @@ VolumeMixer.iconset/
 *.xcodeproj
 .swiftpm/
 
-# Assembled, signed application bundle produced by Scripts/build-app.sh.
-# Rebuildable, and it carries a code signature tied to one machine's identity.
+# Scripts/build-app.sh assembles into build/ (ignored above). The prebuilt
+# VolumeMixer.app at the repository root is tracked on purpose: it is the copy
+# this repository ships, and the build script does not overwrite it.
 
 # Signing material must never enter the repository. The development identity is
 # imported into the login keychain instead; see the README's signing section.
