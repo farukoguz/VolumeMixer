@@ -62,9 +62,14 @@ flowchart LR
   destination folds the right channel into the left rather than dropping it, so
   nothing disappears when something is plugged into a mono output.
 - **Recovery** — the watchdog runs on its own queue, not on the control queue, so it
-  can still release taps if a HAL call is stuck. Engine state shared between the
-  control queue, the watchdog and the UI is guarded by a recursive lock that the
-  audio thread never touches. A freshly started mixer is given a grace period before
+  can still act if a HAL call is stuck. When the mixer stops cycling it fails every
+  muting tap open, so the apps play on their own instead of going silent, and
+  promotion hands them back to the mixer once it cycles again. A mixer stalled for
+  3 s is rebuilt in place; only one that never produces a first cycle has its taps
+  released. Engine state shared between the control queue, the watchdog and the UI
+  is guarded by a recursive lock that the audio thread never touches; the meters
+  read a separate snapshot, so the UI never waits behind a HAL call. A freshly
+  started mixer is given a grace period before
   the watchdog can call it stalled, because waking a dock takes longer than the
   watchdog interval and a mixer that has not produced its first cycle yet is not a
   stalled one.
@@ -129,7 +134,12 @@ the moment it was replaced. `cyclesAtMixerStart` records the cycle count at
 `startMixer()`, and `mixerFirstCycleDeadline` gives it `mixerFirstCycleCeiling`
 (30 s) to produce its first cycle. Only a mixer that has run and then stopped counts
 as stalled — one that has not cycled yet is a device still waking, and waking a dock
-takes longer than the watchdog interval.
+takes longer than the watchdog interval. Stalled means no cycle seen for
+`stallThreshold` (0.5 s), not one empty tick: a tick that runs straight after one
+delayed behind `stateLock` spans microseconds and would see none. While a rebuild
+is pending the watchdog
+neither treats silence as a stall nor promotes probes, so the taps `failOpen()` just
+opened are not muted again onto the mixer that is about to be replaced.
 
 ## Tests
 
@@ -181,7 +191,7 @@ Two things to know before running it:
 - It does not rebuild the app, on purpose. A build signed with a throwaway
   identity is identified by its code hash, so rebuilding makes macOS treat it as a
   different app and silently drops the grant. Build first, grant, then measure.
-- It needs Screen & System Audio Recording granted to `build/VolumeMixer.app`, and
+- It needs System Audio Recording granted to `build/VolumeMixer.app`, and
   a signed build for the grant to survive the next rebuild.
 
 ## Current status

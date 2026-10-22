@@ -16,7 +16,7 @@ APP="$ROOT/build/VolumeMixer.app"
 #
 #   --ad-hoc   sign ad-hoc, ignoring any certificate in the keychain
 #   <name>     build configuration, defaulting to release
-SIGN_AD_HOC=""
+SIGN_AD_HOC="${SIGN_AD_HOC:-}"
 while [ $# -gt 0 ]; do
     case "$1" in
         --ad-hoc) SIGN_AD_HOC=1 ;;
@@ -106,16 +106,15 @@ done
 rmdir "$APP/Contents/Resources" 2>/dev/null || true
 rm -f "$BIN"
 
-# Verify the privacy keys actually made it into the compiled bundle. TCC denial is
+# Verify the privacy key actually made it into the compiled bundle. TCC denial is
 # silent, so a missing key here is the single most important thing to catch.
 #
-# Both keys are required, and they are not interchangeable. `AudioHardwareCreate-
-# ProcessTap` is gated by TCC under Screen & System Audio Recording, which macOS
-# derives from NSScreenCaptureUsageDescription -- not from the Microphone prompt.
-# With only the audio-capture key the app appears under Microphone, is granted
-# there, and every tap still delivers zeros, because the service that governs
-# process taps was never asked for.
-for key in NSScreenCaptureUsageDescription NSAudioCaptureUsageDescription; do
+# `AudioHardwareCreateProcessTap` is gated by TCC's System Audio Recording service
+# (kTCCServiceAudioCapture), which macOS derives from NSAudioCaptureUsageDescription
+# and lists under Privacy & Security > Screen & System Audio Recording > "System
+# Audio Recording Only". Neither Screen Recording nor Microphone access grants it,
+# and the app uses no screen-capture API, so it does not ask for those.
+for key in NSAudioCaptureUsageDescription; do
     if ! plutil -extract "$key" raw "$APP/Contents/Info.plist" >/dev/null 2>&1; then
         echo "!! FATAL: $key missing from bundle -- taps would be silently muted"
         exit 1
@@ -132,13 +131,14 @@ done
 # A real certificate is preferred, and a Development one is enough for a build
 # that will only ever run on the machine that made it. Neither kind helps on
 # somebody else's Mac: Gatekeeper refuses an Apple Development signature
-# outright, so a user must right-click and choose Open once, every time.
+# outright, so a user must allow it once under System Settings > Privacy &
+# Security > Open Anyway.
 #
 # Ad-hoc is not a fallback that "loses" permissions -- it is genuinely
 # grantable. The cost is subtler and worth stating plainly: macOS records a TCC
 # grant against the exact code it saw, so the grant does not survive a rebuild.
-# Change one byte, and the user's screen-recording permission has to be given
-# again. That is fine for someone iterating on the build, and miserable for
+# Change one byte, and the user's System Audio Recording permission has to be
+# given again. That is fine for someone iterating on the build, and miserable for
 # someone handed a download, which is why signing still wins by default.
 #
 # `--ad-hoc` is provided for the case that matters most: a contributor with no
@@ -163,8 +163,13 @@ if [ -n "$SIGN_IDENTITY" ]; then
     # --options runtime is the hardened runtime. Nothing needs it for a local
     # build, but notarisation refuses to accept a bundle without it, and
     # notarisation is what lets this run on a Mac that does not already know the
-    # signing certificate.
-    if ! codesign --force --options runtime --sign "$SIGN_IDENTITY" --timestamp=none "$APP" 2>"$sign_err"; then
+    # signing certificate. Notarisation also requires a secure timestamp, which
+    # only a Developer ID build can use; other builds skip the network round trip.
+    timestamp="--timestamp=none"
+    case "$SIGN_IDENTITY" in
+        "Developer ID Application"*) timestamp="--timestamp" ;;
+    esac
+    if ! codesign --force --options runtime --sign "$SIGN_IDENTITY" "$timestamp" "$APP" 2>"$sign_err"; then
         sed 's/^/    /' "$sign_err"
         echo "!! FATAL: could not sign with $SIGN_IDENTITY." >&2
         if grep -q errSecInternalComponent "$sign_err"; then
@@ -178,9 +183,10 @@ if [ -n "$SIGN_IDENTITY" ]; then
     rm -f "$sign_err"
 else
     echo "==> codesigning (ad-hoc)"
-    echo "    Screen & System Audio Recording can be granted to this build."
+    echo "    System Audio Recording can be granted to this build."
     echo "    The grant is tied to this exact code, so a rebuild means granting it"
-    echo "    again. Gatekeeper will also require right-click > Open the first time."
+    echo "    again. A copy run on another Mac must be allowed once under System"
+    echo "    Settings > Privacy & Security > Open Anyway."
     codesign --force --sign - --timestamp=none "$APP" 2>&1 | sed 's/^/    /'
 fi
 codesign --verify --verbose=1 "$APP" 2>&1 | sed 's/^/    /'

@@ -1,53 +1,54 @@
 import Foundation
+import AudioToolbox
 import CoreAudio
 
 /// User-level output device controls. These are ordinary Core Audio device
 /// properties and need no special permission, so the master volume and device
 /// picker work regardless of whether per-app gain is available.
+///
+/// Everything here acts on the default *output* device, the one the user is
+/// listening to. The default *system* output device is where alerts play, and
+/// it can be a different device: with AirPods selected and sound effects left on
+/// the built-in speakers, using it made the slider change the speakers instead.
 enum SystemVolume {
+
+    private static let scope = AudioObjectPropertyScope(kAudioDevicePropertyScopeOutput)
+
+    /// Whether the output device has a volume control at all. Many HDMI and
+    /// DisplayPort monitors do not.
+    static var hasVolumeControl: Bool {
+        let device = HAL.defaultOutputDevice
+        return device != 0
+            && HAL.isSettable(device, kAudioHardwareServiceDeviceProperty_VirtualMainVolume, scope)
+    }
 
     /// Master volume on the default output device, 0...1.
     ///
-    /// Devices with separate volume controls per channel expose
-    /// `kAudioDevicePropertyVolumeScalar` per element rather than on the main
-    /// element, so element 1 is used as a fallback.
+    /// The virtual main volume rather than `kAudioDevicePropertyVolumeScalar`:
+    /// devices such as AirPods only have per-channel controls, and writing one
+    /// channel's scalar changed the left side alone. The virtual control drives
+    /// whichever controls the device has and keeps the balance between them.
     static func masterVolume() -> Float {
-        let device = HAL.defaultSystemOutputDevice
+        let device = HAL.defaultOutputDevice
         guard device != 0 else { return 1 }
-        let scope = AudioObjectPropertyScope(kAudioDevicePropertyScopeOutput)
-        guard HAL.has(device, kAudioDevicePropertyVolumeScalar, scope) else { return 1 }
-
         var value: Float32 = 1
-        if HAL.read(device, kAudioDevicePropertyVolumeScalar, scope,
-                    kAudioObjectPropertyElementMain, into: &value) == noErr {
-            return value
-        }
-        value = 1
-        if HAL.read(device, kAudioDevicePropertyVolumeScalar, scope, 1, into: &value) == noErr {
-            return value
-        }
-        return 1
+        guard HAL.read(device, kAudioHardwareServiceDeviceProperty_VirtualMainVolume, scope,
+                       into: &value) == noErr else { return 1 }
+        return max(0, min(1, value))
     }
 
     static func setMasterVolume(_ volume: Float) {
-        let device = HAL.defaultSystemOutputDevice
+        let device = HAL.defaultOutputDevice
         guard device != 0 else { return }
-        let scope = AudioObjectPropertyScope(kAudioDevicePropertyScopeOutput)
-        let clamped: Float32 = max(0, min(1, volume))
-
-        var value = clamped
-        var status = HAL.write(device, kAudioDevicePropertyVolumeScalar, scope,
+        var value: Float32 = max(0, min(1, volume))
+        let status = HAL.write(device, kAudioHardwareServiceDeviceProperty_VirtualMainVolume, scope,
                                kAudioObjectPropertyElementMain, &value)
-        if status != noErr {
-            value = clamped
-            status = HAL.write(device, kAudioDevicePropertyVolumeScalar, scope, 1, &value)
-        }
         if status != noErr { Log.error("set master volume: \(fourcc(status))") }
     }
 
     static var isMasterMuted: Bool {
         get {
-            let device = HAL.defaultSystemOutputDevice
+            let device = HAL.defaultOutputDevice
             guard device != 0 else { return false }
             var value: UInt32 = 0
             guard HAL.read(device, kAudioDevicePropertyMute, kAudioObjectPropertyScopeOutput,
@@ -55,7 +56,7 @@ enum SystemVolume {
             return value == 1
         }
         set {
-            let device = HAL.defaultSystemOutputDevice
+            let device = HAL.defaultOutputDevice
             guard device != 0 else { return }
             var value: UInt32 = newValue ? 1 : 0
             let status = HAL.write(device, kAudioDevicePropertyMute, kAudioObjectPropertyScopeOutput,
@@ -76,7 +77,12 @@ struct OutputDevice: Identifiable, Equatable {
 /// can be rebuilt at the right moment.
 final class OutputDeviceMonitor {
 
+    /// The default output device or its format changed. Delivered on main.
     var onChange: (() -> Void)?
+    /// A device was added or removed, e.g. headphones connected without becoming
+    /// the default. Delivered on main. Kept apart from `onChange` so the mixer is
+    /// not rebuilt for a device nothing is playing through.
+    var onDevicesChange: (() -> Void)?
 
     private let queue = DispatchQueue(label: "com.volumemixer.devices")
     private let system = AudioObjectID(kAudioObjectSystemObject)
@@ -84,27 +90,32 @@ final class OutputDeviceMonitor {
     private var timer: DispatchSourceTimer?
     private var lastSignature = ""
 
+    /// State is owned by `queue`, so the first poll cannot race the timer.
     func start() {
-        addListener(kAudioHardwarePropertyDevices)
-        addListener(kAudioHardwarePropertyDefaultOutputDevice)
+        queue.async { [self] in
+            addListener(kAudioHardwarePropertyDevices)
+            addListener(kAudioHardwarePropertyDefaultOutputDevice)
 
-        let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now(), repeating: 2.0)
-        timer.setEventHandler { [weak self] in self?.poll() }
-        timer.resume()
-        self.timer = timer
-        poll()
+            // Fires immediately, so this is also the initial poll.
+            let timer = DispatchSource.makeTimerSource(queue: queue)
+            timer.schedule(deadline: .now(), repeating: 2.0)
+            timer.setEventHandler { [weak self] in self?.poll() }
+            timer.resume()
+            self.timer = timer
+        }
     }
 
     func stop() {
-        timer?.cancel()
-        timer = nil
-        for (selector, block) in listeners {
-            var address = OutputDeviceMonitor.globalAddress(selector)
-            AudioObjectRemovePropertyListenerBlock(system, &address, queue, block)
+        queue.sync {
+            timer?.cancel()
+            timer = nil
+            for (selector, block) in listeners {
+                var address = OutputDeviceMonitor.globalAddress(selector)
+                AudioObjectRemovePropertyListenerBlock(system, &address, queue, block)
+            }
+            listeners.removeAll()
+            lastSignature = ""
         }
-        listeners.removeAll()
-        lastSignature = ""
     }
 
     private static func globalAddress(_ selector: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
@@ -117,7 +128,12 @@ final class OutputDeviceMonitor {
 
     private func addListener(_ selector: AudioObjectPropertySelector) {
         var address = OutputDeviceMonitor.globalAddress(selector)
-        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in self?.poll() }
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            if selector == kAudioHardwarePropertyDevices {
+                DispatchQueue.main.async { [weak self] in self?.onDevicesChange?() }
+            }
+            self?.poll()
+        }
         if AudioObjectAddPropertyListenerBlock(system, &address, queue, block) == noErr {
             listeners[selector] = block
         } else {

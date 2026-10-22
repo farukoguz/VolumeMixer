@@ -4,8 +4,8 @@
 # This is the only distribution path available without a paid Apple Developer
 # Program membership. A Developer ID signature plus notarisation would let a
 # user drag the app into Applications and launch it; without them macOS refuses
-# to open an unattributable build, so the recipient has to right-click and
-# choose Open once. `Scripts/package.sh` cannot change that, and pretending
+# to open an unattributable build, so the recipient has to allow it once under
+# System Settings > Privacy & Security > Open Anyway. `Scripts/package.sh` cannot change that, and pretending
 # otherwise here would only move the failure to the user's first launch.
 #
 # What this does do is make the manual part small and identical for everyone:
@@ -59,9 +59,9 @@ a moment of help the first time. Two steps, once per Mac.
 1. Unzip it, then drag VolumeMixer.app to Applications.
 
 2. Launch it once by hand. macOS will say "cannot be opened because the
-   developer cannot be verified". Right-click (or Control-click) Volume Mixer in
-   Finder, choose Open, and confirm. If the Open button is greyed out, choose
-   "Open anyway" in the same dialog.
+   developer cannot be verified". Click Done, open System Settings > Privacy &
+   Security, click "Open Anyway" next to the message about Volume Mixer, and
+   confirm. (On macOS 14, right-click > Open in Finder also works.)
 
    macOS remembers this per app, so it is only ever needed once.
 

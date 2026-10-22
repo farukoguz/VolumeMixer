@@ -550,7 +550,6 @@ final class SampleRingBuffer {
 
             let base = Int(readStorage.pointee) & mask
             let next = (base + 1) & mask
-            let phase = readPhase.pointee
 
             let l0 = storage[base * 2]
             let r0 = storage[base * 2 + 1]
@@ -623,6 +622,11 @@ final class SampleRingBuffer {
                 // costs the whole feature.
                 steered = ratio
             }
+            // Back at 1:1, snap to the frame grid. A fraction left over from a
+            // drain would otherwise interpolate every later sample part-way
+            // between two inputs for good: a fixed lowpass on the app, and the
+            // end of the bit-exact pass-through promised above.
+            let phase = steered == 1.0 ? 0 : readPhase.pointee
             // Lowpass before decimating, and only then.
             //
             // The filter is what stops above-Nyquist content folding back into

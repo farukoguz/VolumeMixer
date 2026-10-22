@@ -16,16 +16,17 @@ import AppKit
 /// The alert is ours, not macOS's. macOS decides whether to show its own prompt
 /// and remembers the answer either way; showing this one repeatedly would be
 /// nagging, so a dismissal puts it off for a few days.
+@MainActor
 enum PermissionPrompt {
 
-    /// System Settings' pane for audio capture, which is where
-    /// "Screen & System Audio Recording" lives.
+    /// System Settings' "Screen & System Audio Recording" pane (named "Screen
+    /// Recording" on macOS 14).
     ///
-    /// Deliberately the screen-capture pane and not the microphone one. Process
-    /// taps are governed by the screen-capture TCC service, so the microphone
-    /// pane is the wrong list to send the user to: Volume Mixer can be listed
-    /// there and switched on, and every tap still returns silence, because
-    /// granting microphone access says nothing about system audio capture.
+    /// Process taps are governed by the System Audio Recording permission
+    /// (`NSAudioCaptureUsageDescription`), which macOS 14.4 and later list in this
+    /// pane under "System Audio Recording Only". Neither the Microphone pane nor
+    /// the screen-recording list above it on this pane grants it: VolumeMixer
+    /// can be switched on there and every tap still returns silence.
     static func openSettings() {
         guard let url = URL(string:
             "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
@@ -55,15 +56,14 @@ enum PermissionPrompt {
         Per-app volume works by listening to each app's audio with macOS, which \
         needs your permission.
 
-        Screen & System Audio Recording is off, so VolumeMixer cannot change \
+        System Audio Recording is off for VolumeMixer, so it cannot change \
         anything yet. Your other apps keep working normally either way.
 
-        Add VolumeMixer to that list with the + button, turn it on, then press
-        Try Again here.
+        In System Settings, under "System Audio Recording Only", turn \
+        VolumeMixer on, then press Try Again here.
 
-        If VolumeMixer is already listed under Microphone, that is a different
-        permission and switching it on will not help. Check the Screen & System
-        Audio Recording list too.
+        The Screen Recording and Microphone lists are different permissions. \
+        VolumeMixer does not need them, and switching them on will not help.
         """
         alert.addButton(withTitle: "Open System Settings")
         alert.addButton(withTitle: "Try Again")

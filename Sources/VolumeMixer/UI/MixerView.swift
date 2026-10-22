@@ -162,6 +162,7 @@ struct MixerView: View {
             footer
         }
         .frame(width: 340)
+        .background(PanelVisibilityObserver { model.panelVisibilityChanged($0) })
     }
 
     // MARK: Sections
@@ -193,9 +194,9 @@ struct MixerView: View {
                     in: 0...1
                 )
                 .controlSize(.small)
-                .onTapGesture(count: 2) { model.masterVolume = 1 }
+                .disabled(!model.masterVolumeAvailable)
 
-                Text("\(Int(model.masterVolume * 100))")
+                Text(model.masterVolumeAvailable ? "\(Int(model.masterVolume * 100))" : "–")
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .frame(width: 26, alignment: .trailing)

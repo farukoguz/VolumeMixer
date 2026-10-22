@@ -6,7 +6,7 @@ import Testing
 
 /// Per-app gain is the one claim that cannot be checked on a machine without
 /// capture permission: there is no public output meter, and confirming it by ear
-/// needs Screen & System Audio Recording. These tests drive the mixer's real
+/// needs System Audio Recording. These tests drive the mixer's real
 /// per-channel path with ordinary memory instead, so the arithmetic behind the
 /// slider is pinned down even where the hardware cannot confirm it.
 struct GainPathTests {

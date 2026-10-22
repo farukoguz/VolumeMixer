@@ -28,9 +28,9 @@ IDENTITY="$(identity || true)"
 if [ -z "$IDENTITY" ]; then
     echo "!! No signing identity in the keychain."
     echo
-    echo "   With no identity the app can only be signed ad-hoc, and macOS will"
-    echo "   not grant Screen & System Audio Recording to it, so gain cannot be"
-    echo "   measured or verified. To fix that, either:"
+    echo "   With no identity the app can only be signed ad-hoc. macOS still grants"
+    echo "   System Audio Recording to it, but only to that exact build, so every"
+    echo "   rebuild has to be granted again. To keep the grant, either:"
     echo
     echo "   - export a .p12 from XCode > Settings > Accounts > Manage Certificates, then"
     echo "     security import your-cert.p12 -k ~/Library/Keychains/login.keychain-db -T /usr/bin/codesign"

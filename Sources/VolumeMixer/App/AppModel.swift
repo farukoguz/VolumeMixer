@@ -33,9 +33,20 @@ final class AppModel: ObservableObject {
 
     @Published private(set) var channels: [Channel] = []
     @Published private(set) var outputDevices: [OutputDevice] = []
-    @Published var selectedDeviceUID: String = "" { didSet { onDeviceSelected() } }
-    @Published var masterVolume: Double = 1.0 { didSet { onMasterVolumeChanged() } }
-    @Published var masterMuted: Bool = false { didSet { SystemVolume.isMasterMuted = masterMuted } }
+    // These observers write to the hardware. They fire even for assignments in
+    // `init`, so the hardware's own values are only ever copied in through
+    // `syncFromSystem`, which suppresses them.
+    @Published var selectedDeviceUID: String = "" {
+        didSet { if !isMirroringSystem { onDeviceSelected() } }
+    }
+    @Published var masterVolume: Double = 1.0 {
+        didSet { if !isMirroringSystem { onMasterVolumeChanged() } }
+    }
+    @Published var masterMuted: Bool = false {
+        didSet { if !isMirroringSystem { SystemVolume.isMasterMuted = masterMuted } }
+    }
+    /// False when the output device has no volume control, as on many monitors.
+    @Published private(set) var masterVolumeAvailable = true
     @Published private(set) var engineStatus: GainEngineAvailability = .ready
     @Published private(set) var permissionHelpVisible = false
 
@@ -49,6 +60,14 @@ final class AppModel: ObservableObject {
     private var engine: GainEngine
     private var settings: Settings
     private var meterTimer: Timer?
+    /// Set while `syncFromSystem` copies hardware state in, so the property
+    /// observers do not write it straight back out.
+    private var isMirroringSystem = false
+    /// Between `start()` and `stop()`. Gates the meter timer.
+    private var isRunning = false
+    private var hasStopped = false
+    /// Whether the mixer panel is on screen. Meters are only drawn while it is.
+    private var panelVisible = false
     private var persistWorkItem: DispatchWorkItem?
     private var cancellables = Set<AnyCancellable>()
 
@@ -73,11 +92,16 @@ final class AppModel: ObservableObject {
         if #available(macOS 14.2, *) {
             let tapEngine = TapGainEngine()
             engine = tapEngine
-            deviceMonitor.onChange = { [weak self] in
-                (self?.engine as? TapGainEngine)?.handleDeviceChange()
-            }
         } else {
             engine = UnavailableGainEngine(.unsupportedOS)
+        }
+
+        deviceMonitor.onChange = { [weak self] in
+            (self?.engine as? TapGainEngine)?.handleDeviceChange()
+            self?.syncFromSystem()
+        }
+        deviceMonitor.onDevicesChange = { [weak self] in
+            self?.syncFromSystem()
         }
 
         engineStatus = engine.availability
@@ -86,9 +110,11 @@ final class AppModel: ObservableObject {
             self?.audibleAppsChanged(apps)
         }
 
-        masterVolume = Double(settings.masterVolume ?? SystemVolume.masterVolume())
-        masterMuted = SystemVolume.isMasterMuted
-        selectedDeviceUID = settings.lastDeviceUID ?? HAL.deviceUID(HAL.defaultOutputDevice) ?? ""
+        // The system owns the output device and its volume; the keyboard, Control
+        // Center and other apps change them while this app is not looking. So
+        // they are mirrored, not restored: restoring the saved volume here wrote
+        // it back to the hardware on every launch, because the observers fire.
+        syncFromSystem()
     }
 
     // MARK: - Lifecycle
@@ -137,16 +163,10 @@ final class AppModel: ObservableObject {
 
         discovery.start()
         deviceMonitor.start()
-        refreshDevices()
+        syncFromSystem()
 
-        // Meters are polled rather than pushed: the audio thread only ever
-        // writes a peak into a slot, and 30 Hz is smooth enough for a UI meter
-        // while keeping the main thread cheap.
-        let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refreshMeters() }
-        }
-        RunLoop.main.add(timer, forMode: .common)
-        meterTimer = timer
+        isRunning = true
+        scheduleMeterTimer()
 
         runGainSelfTestIfRequested()
     }
@@ -262,7 +282,7 @@ final class AppModel: ObservableObject {
             // Nothing to compare against, so no verdict. Reporting "gain=WRONG"
             // here would blame the gain path for a capture problem.
             Log.error("self-test VERDICT inconclusive: nothing measured at unity. "
-                      + "Screen & System Audio Recording is not granted for this build.")
+                      + "System Audio Recording is not granted for this build.")
             return
         }
         let gainWorks = halfDelta < -2.0 && halfDelta > -10.0
@@ -276,6 +296,11 @@ final class AppModel: ObservableObject {
     }
 
     func stop() {
+        // Quit stops the model and then terminates, which stops it again from
+        // applicationWillTerminate.
+        guard !hasStopped else { return }
+        hasStopped = true
+        isRunning = false
         discovery.stop()
         deviceMonitor.stop()
         meterTimer?.invalidate()
@@ -436,7 +461,8 @@ final class AppModel: ObservableObject {
         // Before the empty-channels guard: a model with nothing audible can still
         // be holding a tap through its grace period.
         detachExpiredProcesses()
-        guard !channels.isEmpty else { return }
+        // Nobody can see a meter in a closed panel. Opening it refreshes at once.
+        guard panelVisible, !channels.isEmpty else { return }
         let liveIDs = engine.liveAppIDs
         var changed = false
         var updated = channels
@@ -516,7 +542,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Re-attempts per-app gain after the user has granted Screen & System Audio
+    /// Re-attempts per-app gain after the user has granted System Audio
     /// Recording. Taps are torn down and rebuilt from scratch, because a tap that
     /// was created while capture was denied cannot start delivering samples
     /// afterwards.
@@ -556,10 +582,55 @@ final class AppModel: ObservableObject {
 
     // MARK: - Devices and master volume
 
-    private func refreshDevices() {
-        outputDevices = OutputDeviceMonitor.availableOutputs()
+    /// Copies the device list, the current output device, and its volume and
+    /// mute state into the UI without writing anything back.
+    ///
+    /// Runs at launch, whenever a device or the default output changes, and
+    /// each time the panel opens, so the picker never shows a device that is no
+    /// longer in use and the slider matches what volume keys last set.
+    func syncFromSystem() {
+        isMirroringSystem = true
+        defer { isMirroringSystem = false }
+
+        let devices = OutputDeviceMonitor.availableOutputs()
+        if devices != outputDevices { outputDevices = devices }
         let current = HAL.deviceUID(HAL.defaultOutputDevice) ?? ""
-        if selectedDeviceUID.isEmpty { selectedDeviceUID = current }
+        if selectedDeviceUID != current { selectedDeviceUID = current }
+
+        let available = SystemVolume.hasVolumeControl
+        if masterVolumeAvailable != available { masterVolumeAvailable = available }
+        let volume = Double(SystemVolume.masterVolume())
+        if abs(masterVolume - volume) > 0.001 { masterVolume = volume }
+        let muted = SystemVolume.isMasterMuted
+        if masterMuted != muted { masterMuted = muted }
+    }
+
+    /// Called by the panel as it opens and closes.
+    func panelVisibilityChanged(_ visible: Bool) {
+        guard visible != panelVisible else { return }
+        panelVisible = visible
+        if visible && isRunning {
+            syncFromSystem()
+            refreshMeters()
+        }
+        scheduleMeterTimer()
+    }
+
+    /// Meters are polled rather than pushed: the audio thread only ever writes a
+    /// peak into a slot. 30 Hz is smooth while the panel is open. With it closed
+    /// the timer only expires held taps and notices engine state changes, which
+    /// a slow tick does just as well without waking the CPU 30 times a second.
+    private func scheduleMeterTimer() {
+        meterTimer?.invalidate()
+        meterTimer = nil
+        guard isRunning else { return }
+        let interval: TimeInterval = panelVisible ? 1.0 / 30.0 : 0.5
+        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refreshMeters() }
+        }
+        timer.tolerance = interval / 4
+        RunLoop.main.add(timer, forMode: .common)
+        meterTimer = timer
     }
 
     private func onDeviceSelected() {
