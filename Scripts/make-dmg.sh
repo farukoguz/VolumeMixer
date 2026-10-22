@@ -17,7 +17,7 @@
 # fails with "cannot be opened because the developer cannot be verified" *after*
 # the user has already moved it. Quarantine is set by whatever downloads a file,
 # not by anything in the image, so it cannot be cleared here -- only avoided, by
-# the right-click step the README explains.
+# the quarantine step the README explains.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

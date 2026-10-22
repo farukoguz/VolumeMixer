@@ -39,11 +39,16 @@ Requires **macOS 14.2 or newer**.
    warn you about an unnotarised build. Only run it on an app you built yourself or
    checked against the release checksum.
 
-   Prefer the mouse? Right-click Volume Mixer in Applications and choose **Open**
-   instead. macOS remembers that choice, but it does not always clear the flag on
-   everything inside the bundle, so the command above is the reliable one.
-4. System Settings → Privacy & Security → **Screen & System Audio Recording** →
-   add Volume Mixer.
+   Prefer the mouse? Try to open Volume Mixer once, click **Done** on the warning,
+   then go to System Settings → Privacy & Security and click **Open Anyway** next
+   to the message about Volume Mixer. (On macOS 14, right-click → **Open** also
+   works; macOS 15 and later removed that shortcut.)
+4. Start something playing. macOS asks whether Volume Mixer may record system
+   audio — choose **Allow**. If you missed it: System Settings → Privacy & Security
+   → **Screen & System Audio Recording** (**Screen Recording** on macOS 14) → under
+   **System Audio Recording Only**, turn Volume Mixer on. That list arrived in
+   macOS 14.4, so on 14.2–14.3 update macOS first. Volume Mixer does not need
+   Screen Recording or Microphone access; switching those on does not help.
 
 Volume Mixer then lives in the menu bar, not the Dock — look for the speaker icon
 next to the clock.
@@ -55,7 +60,9 @@ next to the clock.
 The repository also carries a prebuilt `VolumeMixer.app` at its root, so a plain
 `git clone` gives you something to run without Xcode. It is only refreshed when
 someone commits a new copy — [Releases](https://github.com/farukoguz/VolumeMixer/releases)
-is always the current version.
+is always the current version. It never includes local source changes: after
+changing or patching the source, build with `./Scripts/build-app.sh` and use
+`build/VolumeMixer.app` instead.
 
 To uninstall, drag it from Applications to the Trash.
 

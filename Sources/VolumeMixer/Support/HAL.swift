@@ -75,6 +75,9 @@ enum HAL {
     }
 
     /// Reads an array-of-`AudioObjectID` property, sized first then filled.
+    ///
+    /// The list can shrink between the two calls, so the result is trimmed to the
+    /// size the second call reports rather than padded with `kAudioObjectUnknown`.
     static func readIDs(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector,
                         _ scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal) -> [AudioObjectID] {
         var address = AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: kAudioObjectPropertyElementMain)
@@ -84,7 +87,8 @@ enum HAL {
         let status = ids.withUnsafeMutableBufferPointer {
             AudioObjectGetPropertyData(object, &address, 0, nil, &size, $0.baseAddress!)
         }
-        return status == noErr ? ids : []
+        guard status == noErr else { return [] }
+        return Array(ids.prefix(Int(size) / MemoryLayout<AudioObjectID>.size))
     }
 
     // MARK: - Process objects

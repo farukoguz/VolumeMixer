@@ -8,7 +8,7 @@
 #
 #   1. the architecture -- the bundle must contain the CPU this Mac has
 #   2. trust -- the code signature must be one this Mac accepts
-#   3. permission -- Screen & System Audio Recording is granted per Mac, per
+#   3. permission -- System Audio Recording is granted per Mac, per
 #      user, by hand. No installer can do it, and skipping it is why the app
 #      appears to do nothing at all.
 set -euo pipefail
@@ -76,17 +76,21 @@ Two things are left, and neither can be done by a script.
 
        "Volume Mixer cannot be opened because the developer cannot be verified"
 
-   This is expected, and it is not a problem to fix. Right-click (or
-   Control-click) Volume Mixer in Finder, choose Open, then confirm. macOS
-   remembers that decision for the app, so this is a one-time step per Mac. If
-   the Open button is greyed out, choose "Open anyway" in the same dialog.
+   This is expected, and it is not a problem to fix. Click Done, open System
+   Settings > Privacy & Security, click "Open Anyway" next to the message about
+   Volume Mixer, and confirm. (On macOS 14, right-clicking the app in Finder and
+   choosing Open also works; macOS 15 and later removed that shortcut.) macOS
+   remembers that decision for the app, so this is a one-time step per Mac.
 
    Removing that step entirely needs a Developer ID signature plus Apple
    notarisation, which requires a paid Apple Developer Program membership.
 
 2. GRANT THE PERMISSION -- System Settings > Privacy & Security > Screen &
-   System Audio Recording, then add Volume Mixer. macOS requires this per Mac
-   and per user, and no installer can do it.
+   System Audio Recording (named Screen Recording on macOS 14), then under
+   "System Audio Recording Only" turn Volume Mixer on (add it with + if it is
+   not listed). That list needs macOS 14.4 or later. The screen-recording list
+   above it and the Microphone pane are different permissions and do not help.
+   macOS requires this per Mac and per user, and no installer can do it.
 
    Without it the app still launches and still lists whatever is playing, but
    it cannot read any audio: the taps come up empty, every slider does nothing,

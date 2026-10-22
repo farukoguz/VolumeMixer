@@ -34,32 +34,37 @@ final class ProcessDiscovery {
 
     // MARK: - Lifecycle
 
+    /// All mutable state is owned by `queue`. Start, stop, the timer and every
+    /// listener run there, so the launch scan can never overlap another refresh.
     func start() {
-        guard !isRunning else { return }
-        isRunning = true
+        queue.async { [self] in
+            guard !isRunning else { return }
+            isRunning = true
 
-        // The process object list itself changes as apps launch and exit; that
-        // is the signal to subscribe to any newly appeared objects.
-        addSystemListener(kAudioHardwarePropertyProcessObjectList)
-        installProcessListeners()
+            // The process object list itself changes as apps launch and exit; that
+            // is the signal to subscribe to any newly appeared objects.
+            addSystemListener(kAudioHardwarePropertyProcessObjectList)
+            installProcessListeners()
 
-        let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now(), repeating: pollInterval)
-        timer.setEventHandler { [weak self] in self?.refresh() }
-        timer.resume()
-        self.timer = timer
-
-        refresh()
+            // Fires immediately, so this is also the initial scan.
+            let timer = DispatchSource.makeTimerSource(queue: queue)
+            timer.schedule(deadline: .now(), repeating: pollInterval)
+            timer.setEventHandler { [weak self] in self?.refresh() }
+            timer.resume()
+            self.timer = timer
+        }
     }
 
     func stop() {
-        guard isRunning else { return }
-        isRunning = false
-        timer?.cancel()
-        timer = nil
-        removeAllListeners()
-        lastSignature = []
-        descriptorCache.removeAll()
+        queue.sync {
+            guard isRunning else { return }
+            isRunning = false
+            timer?.cancel()
+            timer = nil
+            removeAllListeners()
+            lastSignature = []
+            descriptorCache.removeAll()
+        }
     }
 
     // MARK: - Listeners
@@ -142,8 +147,10 @@ final class ProcessDiscovery {
     /// rapid start/stop does not rebuild the snapshot many times over.
     private func handleChange() {
         queue.async { [weak self] in
-            self?.installProcessListeners()
-            self?.refresh()
+            // A listener event queued before stop() must not re-subscribe.
+            guard let self, self.isRunning else { return }
+            self.installProcessListeners()
+            self.refresh()
         }
     }
 
@@ -152,6 +159,7 @@ final class ProcessDiscovery {
     /// Computes the current audible set and notifies only when it actually
     /// changed, so the UI is not rebuilt needlessly.
     private func refresh() {
+        dispatchPrecondition(condition: .onQueue(queue))
         let apps = audibleApps()
         let signature = apps.map { "\($0.bundleID)#\($0.pid)" }
         guard signature != lastSignature else { return }
@@ -212,6 +220,6 @@ final class ProcessDiscovery {
 
     /// Current audible set, for callers outside the change callback.
     func currentApps() -> [AudioApp] {
-        audibleApps()
+        queue.sync { audibleApps() }
     }
 }

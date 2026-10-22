@@ -9,9 +9,9 @@
 #
 # It deliberately does NOT rebuild the app. An ad-hoc signed binary is identified
 # by its code hash, so rebuilding makes macOS treat it as a different app and drops
-# the Screen & System Audio Recording grant. Rebuild first, grant, then run this.
+# the System Audio Recording grant. Rebuild first, grant, then run this.
 #
-# Requires: Screen & System Audio Recording granted to build/VolumeMixer.app.
+# Requires: System Audio Recording granted to build/VolumeMixer.app.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -65,6 +65,6 @@ echo
 grep -E "self-test" "$LOG" | sed 's/^\[log\] //; s/^\[error\] //'
 echo
 grep -E "taps deliver only silence" "$LOG" >/dev/null 2>&1 && \
-    echo "!! capture was refused, so nothing was measured. Grant Screen & System" && \
-    echo "   Audio Recording in System Settings > Privacy & Security, then re-run."
+    echo "!! capture was refused, so nothing was measured. Grant System Audio" && \
+    echo "   Recording in System Settings > Privacy & Security, then re-run."
 exit 0

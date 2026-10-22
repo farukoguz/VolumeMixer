@@ -124,8 +124,6 @@ final class TapChannel {
         // as long as anything reads the tap, so a probe would mute the app while
         // having nothing to replace it with if permission turns out to be denied.
         description.muteBehavior = muting ? .mutedWhenTapped : .unmuted
-        isMuting = muting
-        isUnderMixerControl.value = muting
         // 0 until first observed: the audio thread lowers it, and an
         // initial sentinel of "infinity" prints as garbage in the health log.
         minBuffered.value = 0
@@ -134,7 +132,9 @@ final class TapChannel {
 
         var newTapID: AudioObjectID = kAudioObjectUnknown
         let tapStatus = AudioHardwareCreateProcessTap(description, &newTapID)
-        guard tapStatus == noErr, newTapID != kAudioObjectUnknown else { return tapStatus }
+        guard tapStatus == noErr, newTapID != kAudioObjectUnknown else {
+            return tapStatus == noErr ? kAudioHardwareUnspecifiedError : tapStatus
+        }
         tapID = newTapID
 
         // The aggregate deliberately contains *only* the tap. Adding the real
@@ -181,7 +181,7 @@ final class TapChannel {
         let aggregateStatus = AudioHardwareCreateAggregateDevice(aggregate as CFDictionary, &newAggregateID)
         guard aggregateStatus == noErr, newAggregateID != kAudioObjectUnknown else {
             stop()
-            return aggregateStatus
+            return aggregateStatus == noErr ? kAudioHardwareUnspecifiedError : aggregateStatus
         }
         aggregateID = newAggregateID
 
@@ -239,7 +239,7 @@ final class TapChannel {
         }
         guard procStatus == noErr, let ioProc = newIOProc else {
             stop()
-            return procStatus
+            return procStatus == noErr ? kAudioHardwareUnspecifiedError : procStatus
         }
         ioProcID = ioProc
         renderQueue = queue
@@ -249,6 +249,10 @@ final class TapChannel {
             stop()
             return startStatus
         }
+        // Only now: a failure above must not leave the channel claiming a
+        // muting tap (or a mixer-owned ring) that does not exist.
+        isMuting = muting
+        isUnderMixerControl.value = muting
         return noErr
     }
 
@@ -320,7 +324,7 @@ final class TapChannel {
     /// second of audio at the moment of promotion and is inaudible because the
     /// app was still audible on its own right up until that instant.
     func promoteToMuting(outputRateHint: Double = 48_000) {
-        guard !isMuting, tapID != kAudioObjectUnknown else { return }
+        guard !isMuting, !promotionFailed, tapID != kAudioObjectUnknown else { return }
         let queue = renderQueue
         // Promote only with the ring already holding a real cushion. Without this
         // the tap starts muting while its replacement buffer is still nearly
@@ -332,10 +336,17 @@ final class TapChannel {
         guard let queue else { return }
         let status = start(queue: queue, muting: true, outputRateHint: outputRateHint)
         if status != noErr {
-            Log.error("promote \(appID) to muting failed: \(fourcc(status)); audio left untouched")
-            isMuting = false
+            // Back to an unmuted probe rather than no tap at all, which no later
+            // promotion or failOpen could ever reach again. Not retried: a tap
+            // rebuilt every watchdog tick would be heard.
+            Log.error("promote \(appID) to muting failed: \(fourcc(status)); left unmuted")
+            promotionFailed = true
+            _ = start(queue: queue, muting: false, outputRateHint: outputRateHint)
         }
     }
+
+    /// Set once a promotion has failed, so the watchdog stops retrying it.
+    private var promotionFailed = false
 
     /// Stops silencing the app so its audio keeps reaching the output on its own.
     ///
@@ -415,8 +426,9 @@ final class TapChannel {
 ///
 /// The watchdog is the safety property that matters most: taps mute their app
 /// while being read, so if the mixer ever stopped running, every tapped app
-/// would stay silent. The watchdog destroys all taps in that case, returning
-/// every app to normal output at the cost of gain control. Sound wins.
+/// would stay silent. The watchdog fails every muting tap open in that case, so
+/// each app plays on its own until the mixer runs again, and releases all taps
+/// if the mixer never starts at all. Sound wins over gain control.
 @available(macOS 14.2, *)
 final class TapGainEngine: GainEngine {
 
@@ -461,18 +473,18 @@ final class TapGainEngine: GainEngine {
     /// Consecutive watchdog ticks spent with taps that copy frames but never see
     /// a non-zero sample, which is how audio-capture denial looks from here.
     private var silentTicks = 0
-    /// Watchdog ticks of a silent tap before it is released. Each tick is a
-    /// second, and each is also a second the user cannot hear that app.
-    /// Watchdog ticks needed before silence is called a denied permission. The
-    /// tick is now 100 ms, so three ticks is 300 ms rather than three seconds.
-    /// Cutting the detection window was previously unsafe because a muted tap
-    /// made every tick cost the user silence; probes do not mute, so detecting
-    /// the refusal fast costs nothing and keeps a broken tap from lingering.
-    private static let denialTicks = 3
+    /// Watchdog ticks needed before silence is called a denied permission: 10 s.
+    /// Probes do not mute, so waiting costs the user nothing, while a short
+    /// window misreads an app that has opened its output but is still
+    /// buffering, or a page with an idle AudioContext, as a refusal -- which
+    /// the app then records and acts on at every later launch.
+    private static let denialTicks = 100
     /// How long a freshly started mixer is given to produce its first cycle.
     private let mixerStartupGrace: TimeInterval = 3
-    /// Deadline before which a missing cycle is not yet a stall.
-    private var mixerStartDeadline = Date.distantPast
+    /// Deadline before which a missing cycle is not yet a stall. System uptime,
+    /// like every deadline here: a wall clock set back would push it out and
+    /// hold off failing open for as long as the clock is behind.
+    private var mixerStartDeadline: TimeInterval = 0
     /// Cycle count when the current mixer was started. Comparing against this is
     /// how "has not run yet" is told apart from "ran and then stopped", without
     /// the audio thread having to write anything.
@@ -480,7 +492,25 @@ final class TapGainEngine: GainEngine {
     /// Hard cap on how long a mixer may go without ever producing a cycle.
     /// Past this the device is not merely slow to wake and the taps are released.
     private static let mixerFirstCycleCeiling: TimeInterval = 30
-    private var mixerFirstCycleDeadline = Date.distantPast
+    private var mixerFirstCycleDeadline: TimeInterval = 0
+    /// Whether the current mixer has cycled since it started and the watchdog
+    /// saw it cycle within `stallThreshold`. Promotion requires it, so a probe
+    /// is only handed to a mixer that is demonstrably running rather than one
+    /// that merely exists.
+    private var mixerCycling = false
+    /// System uptime at the watchdog tick that last saw the cycle count move.
+    private var lastMixerAdvance: TimeInterval = 0
+    /// How long the mixer may go without a cycle before it counts as stalled.
+    /// Time, not one empty tick: a tick that runs straight after a late one --
+    /// which is every time the watchdog waited on `stateLock` behind a tap
+    /// being created -- spans microseconds and sees no cycle, and a device with
+    /// a long IO buffer can cycle less often than the watchdog ticks.
+    private static let stallThreshold: TimeInterval = 0.5
+    /// How long a mixer that had been running may stay stalled before it is
+    /// rebuilt in place. Longer than the device monitor's 2 s poll plus settle
+    /// delay, so a format change in place (Bluetooth A2DP to HFP) is left to the
+    /// device-change rebuild.
+    private static let stallRestartInterval: TimeInterval = 3
 
     /// The rebuild a device change has scheduled but not yet performed. Any
     /// further change replaces it rather than queueing behind it.
@@ -520,6 +550,12 @@ final class TapGainEngine: GainEngine {
     /// inside a HAL call, which is why the watchdog runs on its own queue rather
     /// than as work on `controlQueue`.
     private let stateLock = NSRecursiveLock()
+
+    /// What the UI reads: each app's peak slots, keyed by identity. Rebuilt by
+    /// `publishChannels` whenever `channels` changes, under a lock that is never
+    /// held across a HAL call.
+    private let snapshotLock = NSLock()
+    private var peakSnapshot: [String: [PeakSlot]] = [:]
 
     /// The value the engine actually wants for an app right now.
     private func effectiveGain(_ appID: String) -> Float {
@@ -573,13 +609,20 @@ final class TapGainEngine: GainEngine {
                                          processKey: app.processKey,
                                          processObjectID: app.processObjectID)
                 guard self.channels[channel.appID] == nil else { return }
-                // Start muted only once capture has been proven this session. Until then
-                // the tap is a passive probe, so an app whose audio we cannot
-                // capture keeps playing instead of being silenced.
-                let status = channel.start(queue: self.tapQueue, muting: self.captureProven,
+                // Mixer first: a muting tap silences its app the instant it starts,
+                // so it may only be created once something is there to put the
+                // audio back.
+                if self.mixerProcID == nil { self.startMixer() }
+                // Start muted only once capture has been proven this session, and
+                // only onto a mixer that can carry the audio. Otherwise the tap is a
+                // passive probe that the watchdog promotes once both hold.
+                let muting = self.captureProven && self.mixerCanCarryAudio
+                    && !self.playsElsewhere(app.processObjectID)
+                let status = channel.start(queue: self.tapQueue, muting: muting,
                                            outputRateHint: Self.tapRateHint())
                 guard status == noErr else {
                     Log.error("tap start failed for \(channel.appID): \(fourcc(status))")
+                    if self.channels.isEmpty { self.stopMixer() }
                     return
                 }
                 // Applied per process, from the app-level level, so a second
@@ -588,7 +631,6 @@ final class TapGainEngine: GainEngine {
 
                 self.channels[channel.appID] = channel
                 self.publishChannels()
-                self.startMixerIfNeeded()
                 Log.lifecycle("attached \(channel.appID) [\(identity)] "
                               + "tap=\(channel.tapID) agg=\(channel.aggregateID)")
             }
@@ -656,19 +698,17 @@ final class TapGainEngine: GainEngine {
     }
 
     func peak(for appID: String) -> Float {
-        // Read from the UI thread while the control queue may be mutating the
-        // dictionary, so this takes the state lock. The peak itself is a plain
-        // aligned read, so it costs nothing on the audio thread. One app can have
+        // Read from the UI thread at 30 Hz, so it must never wait on `stateLock`:
+        // that is held across HAL calls (tap and aggregate creation, device
+        // start) that take from tens of milliseconds to seconds. The snapshot is
+        // rebuilt by `publishChannels` under its own short lock. One app can have
         // several processes, and the loudest one is what the row should show.
-        stateLock.withLock {
-            channels.values
-                .filter { $0.identity == appID }
-                .reduce(Float(0)) { max($0, $1.peak.value) }
-        }
+        let slots = snapshotLock.withLock { peakSnapshot[appID] } ?? []
+        return slots.reduce(Float(0)) { max($0, $1.value) }
     }
 
     var liveAppIDs: Set<String> {
-        stateLock.withLock { Set(channels.values.map(\.identity)) }
+        snapshotLock.withLock { Set(peakSnapshot.keys) }
     }
 
     func shutdown() {
@@ -740,6 +780,11 @@ final class TapGainEngine: GainEngine {
         if dropped > 0 {
             Log.error("channel table full: dropped \(dropped) app(s), capacity=\(ChannelTable.capacity)")
         }
+        var snapshot: [String: [PeakSlot]] = [:]
+        for channel in channels.values {
+            snapshot[channel.identity, default: []].append(channel.peak)
+        }
+        snapshotLock.withLock { peakSnapshot = snapshot }
     }
 
     // MARK: - Mixer
@@ -790,29 +835,56 @@ final class TapGainEngine: GainEngine {
         }
         lastMixerCycle = mixerCycles.value
         cyclesAtMixerStart = mixerCycles.value
+        mixerCycling = false
         // Waking a dock or a Bluetooth device takes seconds, and the first
         // IOProc cycle only arrives once it is awake. Without this the watchdog
         // would see no cycles, call it a stall, and release every tap for a
         // mixer that is merely still starting.
-        mixerStartDeadline = Date().addingTimeInterval(mixerStartupGrace)
-        mixerFirstCycleDeadline = Date().addingTimeInterval(Self.mixerFirstCycleCeiling)
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        mixerStartDeadline = startedAt + mixerStartupGrace
+        mixerFirstCycleDeadline = startedAt + Self.mixerFirstCycleCeiling
         // A previous failure (an unsupported device, say) should not stick once
         // the device has been replaced with something that works.
         availability = .ready
         Log.lifecycle("mixer started device=\(device) rate=\(outputFormat.mSampleRate) ch=\(outputFormat.mChannelsPerFrame)")
     }
 
-    /// Starts the mixer only if it is not already running.
-    private func startMixerIfNeeded() {
-        guard mixerProcID == nil, !channels.isEmpty else { return }
-        startMixer()
+    /// Whether a tap that mutes its app now would have that audio put back: a
+    /// mixer exists, no device change is about to replace it, and it is either
+    /// inside its start-up grace (the watchdog opens the taps if it never runs)
+    /// or the watchdog has seen it cycling.
+    private var mixerCanCarryAudio: Bool {
+        guard mixerProcID != nil, pendingRebuild == nil else { return false }
+        return mixerCycling || ProcessInfo.processInfo.systemUptime < mixerStartDeadline
+    }
+
+    /// Whether the process is known to play to a device other than the one the
+    /// mixer re-injects into. The tap captures the process on every device, so
+    /// muting one that a call app routes to a headset would replay that audio on
+    /// the default device instead. Only positive evidence counts: an empty or
+    /// unreadable list keeps the app under mixer control, rather than failing a
+    /// paused app open and promoting it again on alternate ticks.
+    private func playsElsewhere(_ process: AudioObjectID) -> Bool {
+        HAL.readIDs(process, kAudioProcessPropertyDevices, kAudioObjectPropertyScopeOutput)
+            .contains { $0 != kAudioObjectUnknown && $0 != outputDevice }
+    }
+
+    /// Fails every muting channel open so its app plays on its own. For any
+    /// moment the mixer is not running: a muting tap with nothing reading it
+    /// back out is an app the user cannot hear.
+    private func openMutingChannels(reason: String) {
+        let muting = channels.values.filter(\.isMuting)
+        guard !muting.isEmpty else { return }
+        for channel in muting { channel.failOpen() }
+        Log.error("\(reason): opened \(muting.count) tap(s), apps play on their own")
     }
 
     private func stopMixer() {
         let wasRunning = mixerProcID != nil
+        mixerCycling = false
         // No longer running, so nothing to stall; also stops the grace period
         // from carrying over into an unrelated later start.
-        mixerStartDeadline = .distantPast
+        mixerStartDeadline = 0
         if let proc = mixerProcID {
             _ = AudioDeviceStop(outputDevice, proc)
             _ = AudioDeviceDestroyIOProcID(outputDevice, proc)
@@ -888,11 +960,15 @@ final class TapGainEngine: GainEngine {
         // comes from the stream format, not the buffer list: a mono device also
         // reports one buffer, and treating it as stereo would read half the
         // buffer as frame count and write each sample twice.
-        let interleaved = bufferCount == 1
-        let outputChannels = max(1, min(Int(outputFormat.mChannelsPerFrame), 2))
+        //
+        // The buffer itself says how many channels it interleaves. The format read
+        // when the mixer started can be stale (AirPods drop to mono HFP in place),
+        // and a device with several streams hands over one interleaved buffer per
+        // stream, which is not one buffer per channel.
+        let outputChannels = max(1, Int(first.mNumberChannels))
         let destination = firstData.assumingMemoryBound(to: Float.self)
         let destinationSamples = Int(first.mDataByteSize) / MemoryLayout<Float>.size
-        let frames = destinationSamples / (interleaved ? outputChannels : 1)
+        let frames = destinationSamples / outputChannels
 
         // Clamp rather than dropping the cycle if a device ever asks for more
         // than the buffer we preallocated.
@@ -905,13 +981,15 @@ final class TapGainEngine: GainEngine {
         // aliased to `left`, and `accumulateInterleaved` then writes each sample
         // once instead of adding the same buffer to itself.
         var right = destination
-        if !interleaved && bufferCount > 1 {
+        var deinterleaved = false
+        if outputChannels == 1 && bufferCount > 1 {
             let second = base.load(fromByteOffset: stride, as: AudioBuffer.self)
-            if let secondData = second.mData {
+            if let secondData = second.mData, second.mNumberChannels == 1,
+               Int(second.mDataByteSize) / MemoryLayout<Float>.size >= usableFrames {
                 right = secondData.assumingMemoryBound(to: Float.self)
+                deinterleaved = true
             }
         }
-        let deinterleaved = !interleaved && bufferCount > 1
 
         mixFramesThisCycle = usableFrames
         let sampleCount = usableFrames * 2
@@ -990,8 +1068,7 @@ final class TapGainEngine: GainEngine {
         // hundreds of milliseconds late and phasey against everything else.
         let complete = channel.ring.readRegulated(into: scratch, frameCount: frames,
                                                   rateRatio: ratio,
-                                                  targetFrames: Self.targetBufferFrames,
-                                                  filter: channel.decimationFilter)
+                                                  targetFrames: Self.targetBufferFrames)
         channel.framesConsumed.increment(by: Int64(frames))
         if !complete { channel.starveCount.increment() }
         // Track the worst cushion seen without ever raising it again: a plain
@@ -1040,48 +1117,62 @@ final class TapGainEngine: GainEngine {
 
     private func checkMixerHealth() {
         guard !isShutDown else { return }
-        detectPermissionDenial()
-        guard mixerProcID != nil else { return }
+        // Sampled first: promotion inside `detectPermissionDenial` may only hand
+        // a probe to a mixer that is cycling.
         let now = mixerCycles.value
         let previous = lastMixerCycle
         lastMixerCycle = now
+        let uptime = ProcessInfo.processInfo.systemUptime
+        if now != previous { lastMixerAdvance = uptime }
+        let sinceAdvance = uptime - lastMixerAdvance
+        mixerCycling = mixerProcID != nil && now != cyclesAtMixerStart
+            && sinceAdvance < Self.stallThreshold
+        detectPermissionDenial()
+        guard mixerProcID != nil else { return }
+        // A device change has already opened the taps and is about to replace
+        // this mixer, so its silence is expected rather than a stall.
+        guard pendingRebuild == nil else { return }
 
-        guard now == previous else {
+        guard !mixerCycling else {
             // It is running, so it is not stalled. This also re-arms the "never
             // produced a cycle" cap: a mixer that eventually starts is not a
             // mixer that needs tearing down.
-            mixerFirstCycleDeadline = .distantPast
+            mixerFirstCycleDeadline = 0
+            // A process that moved to another device (a call app switched to a
+            // headset) must not stay muted there and replayed here.
+            for channel in channels.values where channel.isMuting
+                && playsElsewhere(channel.processObjectID) {
+                channel.failOpen()
+            }
             return
         }
         // A mixer that has only just been created has not necessarily produced a
         // cycle yet, so silence here is not yet evidence of a stall.
-        guard Date() >= mixerStartDeadline else { return }
+        guard uptime >= mixerStartDeadline else { return }
 
-        // Silence before the *first* cycle is not a stall at all -- it is a device
-        // that has not finished waking. Releasing here was what made a switch to a
-        // slow device appear to work and then vanish: the taps came back, the
-        // device took longer than the grace period to start, the watchdog read
-        // that silence as a dead mixer, and it dropped everything again.
-        //
-        // So the first cycle is waited for, and only for as long as a device could
-        // plausibly take. Past that ceiling it really is broken.
-        if now == cyclesAtMixerStart {
-            guard Date() < mixerFirstCycleDeadline else {
-                releaseAllTaps(reason: "mixer never produced a cycle")
-                availability = .failed("mixer did not start; audio restored, gain disabled")
-                return
-            }
-            // Not stalled, not started. Wait, and stop counting silence as
-            // evidence by pushing the deadline out rather than releasing.
-            mixerStartDeadline = Date().addingTimeInterval(mixerStartupGrace)
+        // From here nothing is reading the muting taps, so every app they hold
+        // is silent. Open them -- reversible, unlike releasing: promotion puts
+        // them back under mixer control, with the user's gain, once cycles
+        // resume.
+        let neverRan = now == cyclesAtMixerStart
+        openMutingChannels(reason: neverRan ? "mixer has not produced a cycle" : "mixer stalled")
+
+        if neverRan {
+            // Not started. Keep waiting, with the apps audible, for as long as a
+            // device could plausibly take to wake; past that it is broken.
+            guard uptime >= mixerFirstCycleDeadline else { return }
+            releaseAllTaps(reason: "mixer never produced a cycle")
+            availability = .failed("mixer did not start; audio restored, gain disabled")
             return
         }
 
-        // The mixer has run before and has now stopped. That is a genuine stall:
-        // it is running but not being serviced. Anything tapped right now
-        // is muted with no replacement path, so release everything.
-        releaseAllTaps(reason: "mixer stalled")
-        availability = .failed("mixer stalled; audio restored, gain disabled")
+        // Ran and stopped. A device reconfiguring resumes on its own or is
+        // rebuilt by the device monitor; one still dead after that is rebuilt
+        // here, so gain control comes back without waiting for a device change.
+        guard sinceAdvance >= Self.stallRestartInterval else { return }
+        Log.error("mixer stalled for \(Int(sinceAdvance * 1000)) ms; restarting it")
+        stopMixer()
+        startMixer()
     }
 
     /// CoreAudio reports a denied audio-capture permission as success
@@ -1111,23 +1202,30 @@ final class TapGainEngine: GainEngine {
         // down on that basis would kill gain control for apps that are merely
         // idle.
         let probing = channels.values.contains { !$0.isUnderMixerControl.value }
-        guard copying, !audible, probing else {
+        // Once any tap has carried real audio this session the permission is
+        // known to be granted, so later silence is an idle app (a quiet call, a
+        // page holding an AudioContext open), never a refusal worth recording.
+        guard copying, !audible, probing, !captureProven else {
             silentTicks = 0
             // At least one tap is proven good, which also proves the permission
             // is granted. Any probe still lingering can safely go to muting now,
             // because its samples have somewhere to go.
             if audible {
                 noteCaptureProven()
-                promoteVerifiedProbes()
+                // Only onto a mixer that is cycling and is not about to be
+                // replaced. Promoting during a device change re-muted the apps
+                // `handleDeviceChange` had just opened, while the mixer still
+                // played to the old device.
+                if mixerCycling, pendingRebuild == nil {
+                    promoteVerifiedProbes()
+                }
             }
             return
         }
         silentTicks += 1
-        // Three seconds of a tapped app producing pure silence from a tap that is
-        // demonstrably running is not a coincidence. This threshold is also the
-        // length of time the user spends hearing nothing, because the tap has
-        // muted the app for the duration, so it is a damage figure rather than a
-        // confidence figure.
+        // Ten seconds of pure silence from probes that are demonstrably running
+        // is not a coincidence. Probes leave their apps playing, so the wait
+        // costs the user nothing.
         guard silentTicks >= Self.denialTicks else { return }
         if availability == .ready {
             availability = .permissionDenied
@@ -1155,7 +1253,7 @@ final class TapGainEngine: GainEngine {
         let pending = channels.values.filter { !$0.isMuting }
         reportBufferHealth()
         guard !pending.isEmpty else { return }
-        for channel in pending {
+        for channel in pending where !playsElsewhere(channel.processObjectID) {
             Log.lifecycle("promoting verified tap to muting: \(channel.appID)")
             channel.promoteToMuting(outputRateHint: Self.tapRateHint())
         }
@@ -1324,9 +1422,10 @@ final class TapGainEngine: GainEngine {
             guard !isShutDown else { return }
             let coalesced = deferredRebuilds
             deferredRebuilds = 0
-            // Nothing was running, so there is nothing to rebuild and starting one
-            // would hold the output device awake for no reason.
-            guard mixerProcID != nil else { return }
+            // Nothing was running and nothing is attached, so there is nothing to
+            // rebuild. A mixer that failed to start while channels exist (an
+            // unsupported device, say) is exactly what a device change can fix.
+            guard mixerProcID != nil || !channels.isEmpty else { return }
 
             let device = HAL.defaultOutputDevice
             let rate = Self.tapRateHint()
